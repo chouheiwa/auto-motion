@@ -4,7 +4,18 @@
 
 # auto-motion
 
-`auto-motion` is a workflow template that turns an SRT transcript into multiple motion-graphics scenes and stitches them into a vertical video. Provide `transcription.srt`, then run Codex with the instructions in `PROMPT.md`; Codex segments the transcript, calls Claude Code scene by scene, and uses FFmpeg to produce `final.mp4`.
+`auto-motion` provides two workflows for vertical motion-graphics videos. With a final transcript, it can split an SRT into animated scenes. With only an article, spoken script, or reference SRT, it can also handle script revision, TTS, a speech-derived subtitle timeline, frame-zero cover art, BGM, sound effects, mixing, and final delivery.
+
+## Choose a Workflow
+
+| Entry point | Use it when | Deliverables |
+| --- | --- | --- |
+| [`PROMPT.md`](./PROMPT.md) | You already have a final `transcription.srt` and only need silent MG animation | Scene MP4s, Claude logs, and a silent `final.mp4` |
+| [`PROMPT-PRODUCTION.md`](./PROMPT-PRODUCTION.md) | You are starting from an article, spoken script, or reference SRT and need narration plus complete sound | Final script, TTS, speech-derived SRT, scenes, cover, BGM/SFX, mixed video, and audit evidence |
+
+Both entry points share the same single-scene Claude Code execution template. `PROMPT-PRODUCTION.md` adds script, narration, pacing, cover, and sound-production gates without changing the lightweight behavior of `PROMPT.md`.
+
+Treat every piece as a separate production. Start each one in a new clean directory or a dedicated Git worktree based on `main`. Never carry another video's `scenes/`, audio, media, logs, approval files, or `final.mp4` into the new project.
 
 ## Demo
 
@@ -129,7 +140,7 @@ Place your SRT file at the repository root and name it `transcription.srt`:
 cp /path/to/transcription.srt ./transcription.srt
 ```
 
-### 2. Run the automation
+### 2. Run the basic SRT workflow
 
 From the repository root:
 
@@ -155,7 +166,23 @@ scenes/
 final.mp4
 ```
 
-### 3. Open the result
+### 3. Run the complete production workflow
+
+Place the article, spoken script, or reference SRT in the project and configure the MiniMax TTS credentials in the root `.env`. Then run:
+
+```bash
+codex exec \
+  --cd . \
+  --sandbox danger-full-access \
+  --ask-for-approval never \
+  - < PROMPT-PRODUCTION.md
+```
+
+The production workflow has four human review gates: spoken script and opening, TTS voice and phrasing, frame-zero cover, and headphone plus phone-speaker listening. A run may stop at a review gate and continue in the same worktree; do not create a different project or import another production's artifacts.
+
+In addition to `final.mp4`, the audit trail is stored in `production/`, and the final narration subtitles are written to `transcription-production.srt`.
+
+### 4. Open the result
 
 The final video is written to the repository root:
 
@@ -173,11 +200,18 @@ bash auto-test/run.sh
 
 Test artifacts are written to `auto-test/.tmp/`, which is ignored by Git.
 
+Validate the static contract for the complete production template:
+
+```bash
+bash auto-test/validate-production-template.sh
+```
+
 ## Repository Layout
 
 ```text
 .
-├── PROMPT.md                    # Main workflow instructions
+├── PROMPT.md                    # Basic silent workflow for an existing SRT
+├── PROMPT-PRODUCTION.md         # Complete script-to-scored-video workflow
 ├── transcription.srt            # Input transcript
 ├── exampleFolder/
 │   ├── run-claude-ai.sh          # Single-scene Claude Code template
@@ -185,7 +219,9 @@ Test artifacts are written to `auto-test/.tmp/`, which is ignored by Git.
 ├── auto-test/
 │   ├── run.sh                    # End-to-end test entry point
 │   ├── validate.sh               # Video validation script
+│   ├── validate-production-template.sh # Production-template contract check
 │   └── transcription.srt         # Test transcript
+├── production/                  # Per-run config, audio, and audit evidence
 └── final.mp4                     # Generated delivery video
 ```
 
@@ -195,3 +231,4 @@ Test artifacts are written to `auto-test/.tmp/`, which is ignored by Git.
 - Scenes must continuously cover the subtitle timeline, and the sum of scene durations should match the transcript duration.
 - If a scene fails, inspect its `stderr.log`, `stream.jsonl`, and `user.log` first.
 - If scene video specs differ, normalize them before stitching.
+- Machine audio checks in the complete workflow do not replace a final headphone and phone-speaker listening pass.

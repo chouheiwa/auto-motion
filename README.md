@@ -4,7 +4,18 @@
 
 # auto-motion
 
-`auto-motion` 是一个把字幕稿自动拆分成多段 MG 动画镜头，并拼接成竖屏视频的工作流模板。你只需要准备 `transcription.srt`，然后让 Codex 执行 `PROMPT.md` 中的任务说明；Codex 会按字幕语义拆镜头，逐个调用 Claude Code 生成单镜头动画，最后用 FFmpeg 拼接出 `final.mp4`。
+`auto-motion` 提供两条竖屏 MG 视频制作流程：已有定稿字幕时，可以直接把 SRT 拆成多个动画镜头；只有文章或口播稿时，也可以完成稿件整理、TTS、真实字幕时间轴、首帧封面、BGM、音效、混音和最终成片。
+
+## 选择工作流
+
+| 入口 | 适用情况 | 交付结果 |
+| --- | --- | --- |
+| [`PROMPT.md`](./PROMPT.md) | 已有定稿 `transcription.srt`，只需要制作静音 MG 动画 | 分镜 MP4、Claude 日志、静音 `final.mp4` |
+| [`PROMPT-PRODUCTION.md`](./PROMPT-PRODUCTION.md) | 从文章、口播稿或参考 SRT 开始，需要配音和完整声音制作 | 终稿、TTS、真实 SRT、分镜、封面、BGM/SFX、混音成片和验收证据 |
+
+两个入口共享同一个单镜头 Claude Code 执行模板。`PROMPT-PRODUCTION.md` 在基础流程外增加了稿件、配音、节奏、封面和声音制作关卡，不会改变 `PROMPT.md` 的轻量行为。
+
+每篇内容都是一次独立制作。开始新项目时，请使用新的干净目录，或基于 `main` 创建专用 Git worktree；不要把上一条视频的 `scenes/`、音频、素材、日志、审批文件或 `final.mp4` 带入新项目。
 
 ## 效果演示
 
@@ -129,7 +140,7 @@ jq --version
 cp /path/to/transcription.srt ./transcription.srt
 ```
 
-### 2. 执行自动生成流程
+### 2. 执行基础 SRT 流程
 
 在仓库根目录运行：
 
@@ -155,7 +166,23 @@ scenes/
 final.mp4
 ```
 
-### 3. 查看结果
+### 3. 执行完整制作流程
+
+准备文章、口播稿或参考 SRT，并在项目根目录的 `.env` 中配置 MiniMax TTS 凭据。然后运行：
+
+```bash
+codex exec \
+  --cd . \
+  --sandbox danger-full-access \
+  --ask-for-approval never \
+  - < PROMPT-PRODUCTION.md
+```
+
+完整流程包含四个人工审核点：口播稿与开场、TTS 音色与断句、首帧封面、耳机与手机外放试听。一次执行在审核点结束后，可以在同一 worktree 中继续；不要另建项目或复用其他作品的产物。
+
+除 `final.mp4` 外，制作证据保存在 `production/`，最终配音字幕为 `transcription-production.srt`。
+
+### 4. 查看结果
 
 最终视频在仓库根目录：
 
@@ -173,11 +200,18 @@ bash auto-test/run.sh
 
 测试产物会写入 `auto-test/.tmp/`。该目录已被 `.gitignore` 忽略。
 
+检查完整制作模板的静态合同：
+
+```bash
+bash auto-test/validate-production-template.sh
+```
+
 ## 目录说明
 
 ```text
 .
-├── PROMPT.md                    # 主流程任务说明
+├── PROMPT.md                    # 已有 SRT 的基础静音流程
+├── PROMPT-PRODUCTION.md         # 从稿件到带声音成片的完整流程
 ├── transcription.srt            # 输入字幕文件
 ├── exampleFolder/
 │   ├── run-claude-ai.sh          # 单镜头 Claude Code 调用模板
@@ -185,7 +219,9 @@ bash auto-test/run.sh
 ├── auto-test/
 │   ├── run.sh                    # 端到端测试入口
 │   ├── validate.sh               # 视频产物校验脚本
+│   ├── validate-production-template.sh # 完整模板合同检查
 │   └── transcription.srt         # 测试字幕
+├── production/                  # 单次完整制作的配置、音频和验收证据
 └── final.mp4                     # 生成后的视频交付文件
 ```
 
@@ -195,3 +231,4 @@ bash auto-test/run.sh
 - 每个镜头必须完整覆盖字幕时间轴，镜头时长总和应等于字幕总时长。
 - 若某个镜头失败，优先查看对应目录下的 `stderr.log`、`stream.jsonl` 和 `user.log`。
 - 如果视频规格不一致，应先统一转码后再拼接。
+- 完整制作流程中的机器声音检查不能代替发布前的耳机和手机外放试听。
