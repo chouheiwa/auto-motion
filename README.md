@@ -66,7 +66,20 @@ qwen 3.8则负责写react代码
 
 ## 架构
 
-### 1. 调度层：Codex + PROMPT.md
+### 1. 配置层：auto-motion.conf
+
+`auto-motion.conf` 定义编排工具和渲染工具的组合。编排层和渲染层都可以从 Codex、Claude Code、Qoder 中三选一，但同一个工具不能同时担任两个角色。
+
+```bash
+# 编排工具：codex | claude | qoder
+ORCHESTRATOR=codex
+# 渲染工具：codex | claude | qoder（必须与 ORCHESTRATOR 不同）
+RENDERER=claude
+```
+
+也可以通过环境变量或 `.env` 文件覆盖：`ORCHESTRATOR=qoder RENDERER=claude bash run-orchestrator.sh`。
+
+### 2. 调度层：编排工具 + PROMPT.md
 
 `PROMPT.md` 定义整个自动化流程：
 
@@ -74,12 +87,12 @@ qwen 3.8则负责写react代码
 - 按语义把字幕拆成连续、完整覆盖总时长的镜头。
 - 为每个镜头创建 `scenes/scene-001`、`scenes/scene-002` 等独立目录。
 - 从 `exampleFolder` 复制运行模板和 HyperFrames 相关技能。
-- 顺序调用 Claude Code 生成每个镜头的动画 MP4。
+- 顺序调用渲染工具生成每个镜头的动画 MP4。
 - 检查镜头时长和产物规格，并用 FFmpeg 拼接为 `final.mp4`。
 
-### 2. 执行层：Claude Code + run-claude-ai.sh
+### 3. 执行层：渲染工具 + run-scene.sh
 
-`exampleFolder/run-claude-ai.sh` 是单镜头执行模板。Codex 会为每个镜头填写：
+`exampleFolder/run-scene.sh` 是单镜头执行模板。编排工具会为每个镜头填写：
 
 - `SCENE_ID`
 - `SCENE_DURATION_SECONDS`
@@ -87,21 +100,21 @@ qwen 3.8则负责写react代码
 - `OUTPUT_FILE`
 - `FULL_TRANSCRIPT_PATH`
 
-脚本使用 `claude -p` 非交互式调用 Claude Code，并要求 Claude Code 输出固定阶段消息。原始日志、错误日志和用户可读进度分别写入镜头目录中的：
+脚本根据 `RENDERER` 配置选择对应的 CLI 非交互式调用，并要求输出固定阶段消息。原始日志、错误日志和用户可读进度分别写入镜头目录中的：
 
-- `claude-<scene>.stream.jsonl`
-- `claude-<scene>.stderr.log`
-- `claude-<scene>.user.log`
+- `render-<scene>.stream.jsonl`
+- `render-<scene>.stderr.log`
+- `render-<scene>.user.log`
 
-### 3. 动画层：HyperFrames
+### 4. 动画层：HyperFrames
 
-`exampleFolder/.claude/skills/` 中包含 HyperFrames 相关技能。Claude Code 会基于这些技能编写 HTML 动画项目，并渲染 1080x1440、30fps、静音、无音轨的 MP4。
+`exampleFolder/.claude/skills/` 中包含 HyperFrames 相关技能。Claude Code 渲染时自动发现这些技能；Qoder 使用内置 HyperFrames 技能；Codex 渲染时由 `run-scene.sh` 在提示词中引用技能文件。渲染工具基于这些技能编写 HTML 动画项目，并渲染 1080x1440、30fps、静音、无音轨的 MP4。
 
-### 4. 验收层：auto-test
+### 5. 验收层：auto-test
 
-`auto-test/run.sh` 提供端到端测试入口。它会创建临时工作区，复制测试字幕和模板，调用 Codex 执行完整流程，然后用 `auto-test/validate.sh` 检查：
+`auto-test/run.sh` 提供端到端测试入口。它会创建临时工作区，复制测试字幕和模板，按配置启动编排工具执行完整流程，然后用 `auto-test/validate.sh` 检查：
 
-- Claude Code 阶段消息是否完整。
+- 渲染工具阶段消息是否完整。
 - 单镜头 MP4 和 `final.mp4` 是否存在。
 - 视频是否为 1080x1440。
 - 帧率是否约为 30fps。
@@ -110,20 +123,22 @@ qwen 3.8则负责写react代码
 
 ## 前提条件
 
-请先确保本机已经安装并登录以下工具：
+请先确保本机已安装并登录以下工具中的**至少两个**（编排层和渲染层各一个，不能相同）：
 
 - [Codex CLI](https://developers.openai.com/codex/cli)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+- [QoderCN CLI](https://help.aliyun.com/document_detail/3033350.html)
 - Node.js 22 或更高版本
 - FFmpeg 和 FFprobe
 - `jq`
-- 可联网环境，用于 Claude Code 搜索素材、安装依赖或下载品牌视觉资产
+- 可联网环境，用于渲染工具搜索素材、安装依赖或下载品牌视觉资产
 
 可以用下面的命令做基础检查：
 
 ```bash
 codex --version
 claude --version
+qoderclicn --version
 node --version
 ffmpeg -version
 ffprobe -version
@@ -142,25 +157,27 @@ cp /path/to/transcription.srt ./transcription.srt
 
 ### 2. 执行基础 SRT 流程
 
-在仓库根目录运行：
+编辑 `auto-motion.conf` 选择编排工具和渲染工具，然后在仓库根目录运行：
 
 ```bash
-codex exec \
-  --cd . \
-  --sandbox danger-full-access \
-  --ask-for-approval never \
-  - < PROMPT.md
+bash run-orchestrator.sh
 ```
 
-Codex 会读取 `PROMPT.md`，拆分字幕、创建镜头目录、逐个调用 Claude Code，并最终生成：
+或者通过环境变量一次性指定：
+
+```bash
+ORCHESTRATOR=qoder RENDERER=claude bash run-orchestrator.sh
+```
+
+编排工具会读取 `PROMPT.md`，拆分字幕、创建镜头目录、逐个调用渲染工具，并最终生成：
 
 ```text
 scenes/
   scene-001/
     scene-001.mp4
-    claude-scene-001.stream.jsonl
-    claude-scene-001.stderr.log
-    claude-scene-001.user.log
+    render-scene-001.stream.jsonl
+    render-scene-001.stderr.log
+    render-scene-001.user.log
   scene-002/
     scene-002.mp4
 final.mp4
@@ -168,14 +185,10 @@ final.mp4
 
 ### 3. 执行完整制作流程
 
-准备文章、口播稿或参考 SRT，并在项目根目录的 `.env` 中配置 MiniMax TTS 凭据。然后运行：
+准备文章、口播稿和参考 SRT，并在项目根目录的 `.env` 中配置 MiniMax TTS 凭据。然后运行：
 
 ```bash
-codex exec \
-  --cd . \
-  --sandbox danger-full-access \
-  --ask-for-approval never \
-  - < PROMPT-PRODUCTION.md
+bash run-orchestrator.sh PROMPT-PRODUCTION.md
 ```
 
 完整流程包含四个人工审核点：口播稿与开场、TTS 音色与断句、首帧封面、耳机与手机外放试听。一次执行在审核点结束后，可以在同一 worktree 中继续；不要另建项目或复用其他作品的产物。
@@ -210,24 +223,29 @@ bash auto-test/validate-production-template.sh
 
 ```text
 .
-├── PROMPT.md                    # 已有 SRT 的基础静音流程
-├── PROMPT-PRODUCTION.md         # 从稿件到带声音成片的完整流程
-├── transcription.srt            # 输入字幕文件
+├── auto-motion.conf              # 编排/渲染工具配置
+├── run-orchestrator.sh            # 便捷入口：按配置启动编排工具
+├── lib/
+│   └── auto-motion.sh             # 共享 shell 库（CLI 分发）
+├── PROMPT.md                      # 已有 SRT 的基础静音流程
+├── PROMPT-PRODUCTION.md           # 从稿件到带声音成片的完整流程
+├── transcription.srt              # 输入字幕文件
 ├── exampleFolder/
-│   ├── run-claude-ai.sh          # 单镜头 Claude Code 调用模板
-│   └── .claude/skills/           # HyperFrames 相关技能
+│   ├── run-scene.sh               # 单镜头渲染模板（支持 claude/qoder/codex）
+│   ├── run-claude-ai.sh           # 旧版 Claude Code 专用模板（保留兼容）
+│   └── .claude/skills/            # HyperFrames 相关技能
 ├── auto-test/
-│   ├── run.sh                    # 端到端测试入口
-│   ├── validate.sh               # 视频产物校验脚本
+│   ├── run.sh                     # 端到端测试入口
+│   ├── validate.sh                # 视频产物校验脚本
 │   ├── validate-production-template.sh # 完整模板合同检查
-│   └── transcription.srt         # 测试字幕
-├── production/                  # 单次完整制作的配置、音频和验收证据
-└── final.mp4                     # 生成后的视频交付文件
+│   └── transcription.srt          # 测试字幕
+├── production/                    # 单次完整制作的配置、音频和验收证据
+└── final.mp4                      # 生成后的视频交付文件
 ```
 
 ## 注意事项
 
-- 同一时间只运行一个 Claude Code 调用，不并行渲染多个镜头。
+- 同一时间只运行一个渲染工具调用，不并行渲染多个镜头。
 - 每个镜头必须完整覆盖字幕时间轴，镜头时长总和应等于字幕总时长。
 - 若某个镜头失败，优先查看对应目录下的 `stderr.log`、`stream.jsonl` 和 `user.log`。
 - 如果视频规格不一致，应先统一转码后再拼接。

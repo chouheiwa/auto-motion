@@ -5,7 +5,7 @@ ROOT_DIR="${1:-$(pwd)}"
 SCENE_DIR="$ROOT_DIR/scenes/scene-001"
 SCENE_MP4="$SCENE_DIR/scene-001.mp4"
 FINAL_MP4="$ROOT_DIR/final.mp4"
-USER_LOG="$SCENE_DIR/claude-scene-001.user.log"
+USER_LOG="$SCENE_DIR/render-scene-001.user.log"
 
 fail() {
   echo "auto-test FAIL: $*" >&2

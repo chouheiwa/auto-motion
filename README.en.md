@@ -66,7 +66,20 @@ Below is a screenshot from a real run: a multi-scene job has been running for 1 
 
 ## Architecture
 
-### 1. Orchestration: Codex + PROMPT.md
+### 1. Configuration: auto-motion.conf
+
+`auto-motion.conf` defines the orchestrator and renderer combination. Both layers can use any of Codex, Claude Code, or Qoder, but the same tool cannot serve as both.
+
+```bash
+# Orchestrator: codex | claude | qoder
+ORCHESTRATOR=codex
+# Renderer: codex | claude | qoder (must differ from ORCHESTRATOR)
+RENDERER=claude
+```
+
+Override with environment variables or `.env` file: `ORCHESTRATOR=qoder RENDERER=claude bash run-orchestrator.sh`.
+
+### 2. Orchestration: Orchestrator + PROMPT.md
 
 `PROMPT.md` defines the full automation flow:
 
@@ -74,12 +87,12 @@ Below is a screenshot from a real run: a multi-scene job has been running for 1 
 - Split the transcript into semantic scenes that continuously cover the full subtitle timeline.
 - Create independent scene folders such as `scenes/scene-001` and `scenes/scene-002`.
 - Copy the execution template and HyperFrames skills from `exampleFolder`.
-- Call Claude Code sequentially to generate each scene MP4.
+- Call the renderer sequentially to generate each scene MP4.
 - Check scene duration and output specs, then stitch all scene videos into `final.mp4` with FFmpeg.
 
-### 2. Execution: Claude Code + run-claude-ai.sh
+### 3. Execution: Renderer + run-scene.sh
 
-`exampleFolder/run-claude-ai.sh` is the single-scene execution template. Codex fills in the scene-specific values:
+`exampleFolder/run-scene.sh` is the single-scene execution template. The orchestrator fills in the scene-specific values:
 
 - `SCENE_ID`
 - `SCENE_DURATION_SECONDS`
@@ -87,21 +100,21 @@ Below is a screenshot from a real run: a multi-scene job has been running for 1 
 - `OUTPUT_FILE`
 - `FULL_TRANSCRIPT_PATH`
 
-The script invokes Claude Code non-interactively through `claude -p` and requires fixed progress messages. Raw logs, stderr logs, and user-readable progress are written into each scene folder:
+The script dispatches to the configured renderer CLI and requires fixed progress messages. Raw logs, stderr logs, and user-readable progress are written into each scene folder:
 
-- `claude-<scene>.stream.jsonl`
-- `claude-<scene>.stderr.log`
-- `claude-<scene>.user.log`
+- `render-<scene>.stream.jsonl`
+- `render-<scene>.stderr.log`
+- `render-<scene>.user.log`
 
-### 3. Motion Authoring: HyperFrames
+### 4. Motion Authoring: HyperFrames
 
-`exampleFolder/.claude/skills/` contains the HyperFrames skills used by Claude Code. Claude Code writes an HTML animation project with those skills and renders a 1080x1440, 30fps, silent MP4 with no audio track.
+`exampleFolder/.claude/skills/` contains the HyperFrames skills. Claude Code auto-discovers them; Qoder uses its built-in HyperFrames skills; Codex reads them via prompt references in `run-scene.sh`. The renderer writes an HTML animation project with those skills and renders a 1080x1440, 30fps, silent MP4 with no audio track.
 
-### 4. Validation: auto-test
+### 5. Validation: auto-test
 
-`auto-test/run.sh` provides an end-to-end test entry point. It creates a temporary workspace, copies the test transcript and templates, asks Codex to run the full flow, then uses `auto-test/validate.sh` to verify:
+`auto-test/run.sh` provides an end-to-end test entry point. It creates a temporary workspace, copies the test transcript and templates, launches the configured orchestrator, then uses `auto-test/validate.sh` to verify:
 
-- Required Claude Code progress messages are present.
+- Required renderer progress messages are present.
 - The scene MP4 and `final.mp4` exist.
 - Video resolution is 1080x1440.
 - Frame rate is approximately 30fps.
@@ -110,20 +123,22 @@ The script invokes Claude Code non-interactively through `claude -p` and require
 
 ## Prerequisites
 
-Install and sign in to the following tools first:
+Install and sign in to **at least two** of the following tools (one for orchestration, one for rendering; they must differ):
 
 - [Codex CLI](https://developers.openai.com/codex/cli)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+- [QoderCN CLI](https://help.aliyun.com/document_detail/3033350.html)
 - Node.js 22 or newer
 - FFmpeg and FFprobe
 - `jq`
-- Network access, so Claude Code can search for references, install dependencies, or download brand visual assets
+- Network access, so the renderer can search for references, install dependencies, or download brand visual assets
 
 Run these checks before starting:
 
 ```bash
 codex --version
 claude --version
+qoderclicn --version
 node --version
 ffmpeg -version
 ffprobe -version
@@ -142,25 +157,27 @@ cp /path/to/transcription.srt ./transcription.srt
 
 ### 2. Run the basic SRT workflow
 
-From the repository root:
+Edit `auto-motion.conf` to choose the orchestrator and renderer, then run from the repository root:
 
 ```bash
-codex exec \
-  --cd . \
-  --sandbox danger-full-access \
-  --ask-for-approval never \
-  - < PROMPT.md
+bash run-orchestrator.sh
 ```
 
-Codex reads `PROMPT.md`, splits the transcript, creates scene folders, calls Claude Code scene by scene, and produces:
+Or specify via environment variables:
+
+```bash
+ORCHESTRATOR=qoder RENDERER=claude bash run-orchestrator.sh
+```
+
+The orchestrator reads `PROMPT.md`, splits the transcript, creates scene folders, calls the renderer scene by scene, and produces:
 
 ```text
 scenes/
   scene-001/
     scene-001.mp4
-    claude-scene-001.stream.jsonl
-    claude-scene-001.stderr.log
-    claude-scene-001.user.log
+    render-scene-001.stream.jsonl
+    render-scene-001.stderr.log
+    render-scene-001.user.log
   scene-002/
     scene-002.mp4
 final.mp4
@@ -171,11 +188,7 @@ final.mp4
 Place the article, spoken script, or reference SRT in the project and configure the MiniMax TTS credentials in the root `.env`. Then run:
 
 ```bash
-codex exec \
-  --cd . \
-  --sandbox danger-full-access \
-  --ask-for-approval never \
-  - < PROMPT-PRODUCTION.md
+bash run-orchestrator.sh PROMPT-PRODUCTION.md
 ```
 
 The production workflow has four human review gates: spoken script and opening, TTS voice and phrasing, frame-zero cover, and headphone plus phone-speaker listening. A run may stop at a review gate and continue in the same worktree; do not create a different project or import another production's artifacts.
@@ -210,24 +223,29 @@ bash auto-test/validate-production-template.sh
 
 ```text
 .
-├── PROMPT.md                    # Basic silent workflow for an existing SRT
-├── PROMPT-PRODUCTION.md         # Complete script-to-scored-video workflow
-├── transcription.srt            # Input transcript
+├── auto-motion.conf              # Orchestrator/renderer config
+├── run-orchestrator.sh            # Entry point: launches configured orchestrator
+├── lib/
+│   └── auto-motion.sh             # Shared shell library (CLI dispatch)
+├── PROMPT.md                      # Basic silent workflow for an existing SRT
+├── PROMPT-PRODUCTION.md           # Complete script-to-scored-video workflow
+├── transcription.srt              # Input transcript
 ├── exampleFolder/
-│   ├── run-claude-ai.sh          # Single-scene Claude Code template
-│   └── .claude/skills/           # HyperFrames skills
+│   ├── run-scene.sh               # Single-scene renderer template (claude/qoder/codex)
+│   ├── run-claude-ai.sh           # Legacy Claude Code template (kept for compat)
+│   └── .claude/skills/            # HyperFrames skills
 ├── auto-test/
-│   ├── run.sh                    # End-to-end test entry point
-│   ├── validate.sh               # Video validation script
+│   ├── run.sh                     # End-to-end test entry point
+│   ├── validate.sh                # Video validation script
 │   ├── validate-production-template.sh # Production-template contract check
-│   └── transcription.srt         # Test transcript
-├── production/                  # Per-run config, audio, and audit evidence
-└── final.mp4                     # Generated delivery video
+│   └── transcription.srt          # Test transcript
+├── production/                    # Per-run config, audio, and audit evidence
+└── final.mp4                      # Generated delivery video
 ```
 
 ## Notes
 
-- Only one Claude Code call should run at a time; scene rendering is intentionally sequential.
+- Only one renderer call should run at a time; scene rendering is intentionally sequential.
 - Scenes must continuously cover the subtitle timeline, and the sum of scene durations should match the transcript duration.
 - If a scene fails, inspect its `stderr.log`, `stream.jsonl`, and `user.log` first.
 - If scene video specs differ, normalize them before stitching.

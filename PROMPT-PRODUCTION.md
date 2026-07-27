@@ -1,6 +1,6 @@
 # 完成一次从稿件到成片的竖屏 MG 视频制作
 
-在当前工作目录完成一次独立的视频制作：把文章、口播稿或参考字幕整理成适合配音的终稿，生成并校对 TTS，依据真实语音重建字幕和时间轴，按语义拆分镜头，顺序调用 Claude AI 制作 MG 动画，再加入首帧封面、背景音乐和音效，最终交付 `final.mp4` 及完整制作证据。
+在当前工作目录完成一次独立的视频制作：把文章、口播稿或参考字幕整理成适合配音的终稿，生成并校对 TTS，依据真实语音重建字幕和时间轴，按语义拆分镜头，顺序调用渲染工具制作 MG 动画，再加入首帧封面、背景音乐和音效，最终交付 `final.mp4` 及完整制作证据。
 
 ## 一次性项目边界
 
@@ -13,11 +13,11 @@
 
 ## 工作边界
 
-- Claude AI 负责单个镜头内部的创意、动画方案、代码实现和 MP4 渲染。
-- 你负责整理稿件、建立真实时间轴、拆分镜头、准备镜头目录、调整每个 `run-claude-ai.sh` 的提示词、顺序调度、检查产物、处理配音和声音、拼接与最终验收。
-- 不替 Claude AI 设计镜头内部的具体 MG 动效。可以根据镜头文案强化提示词中的语义、艺术方向和表达重点。
-- 不得改变 `exampleFolder/run-claude-ai.sh` 的执行契约：非交互式运行、镜头编号、时长、输出文件名、完整字幕路径、阶段性汇报格式、日志过滤方式和 MP4 交付要求必须保持确定。
-- 同一时间只运行一个 Claude AI 调用，不并行启动多个镜头。
+- 渲染工具负责单个镜头内部的创意、动画方案、代码实现和 MP4 渲染。
+- 你负责整理稿件、建立真实时间轴、拆分镜头、准备镜头目录、调整每个 `run-scene.sh` 的提示词、顺序调度、检查产物、处理配音和声音、拼接与最终验收。
+- 不替渲染工具设计镜头内部的具体 MG 动效。可以根据镜头文案强化提示词中的语义、艺术方向和表达重点。
+- 不得改变 `exampleFolder/run-scene.sh` 的执行契约：非交互式运行、镜头编号、时长、输出文件名、完整字幕路径、阶段性汇报格式、日志过滤方式和 MP4 交付要求必须保持确定。
+- 同一时间只运行一个渲染工具调用，不并行启动多个镜头。
 - 不把任何 API 密钥写入脚本、Markdown、JSON、命令行参数或日志。
 
 ## 第一阶段：盘点输入和制作规格
@@ -133,7 +133,7 @@
 - 无文字空白并入前一个镜头作为停顿、收尾或转场；很长的空白可以单独成为静默/转场镜头。
 - 镜头时长以秒表示并保留毫秒精度，例如 `2.833`、`6.500`。
 
-调用 Claude AI 前必须复核：
+调用渲染工具前必须复核：
 
 - 所有 `SCENE_DURATION_SECONDS` 之和等于最终节目时长，误差不超过 0.1 秒。
 - 换算后的各镜头帧数之和等于总帧数。
@@ -141,7 +141,7 @@
 
 把分镜写入 `production/scene-plan.json` 和 `production/scene-plan.md`。
 
-## 第六阶段：建立镜头目录并顺序调用 Claude AI
+## 第六阶段：建立镜头目录并顺序调用渲染工具
 
 每个镜头使用独立目录，例如：
 
@@ -149,14 +149,14 @@
 scenes/
   scene-001/
     .claude/
-    run-claude-ai.sh
+    run-scene.sh
     transcription.srt
 ```
 
 每个镜头必须：
 
-- 从 `exampleFolder` 复制 `.claude/` 和 `run-claude-ai.sh`。
-- 把完整的 `transcription-production.srt` 复制为镜头目录中的 `transcription.srt`，让 Claude AI 理解全文上下文。
+- 从 `exampleFolder` 复制 `.claude/` 和 `run-scene.sh`。
+- 把完整的 `transcription-production.srt` 复制为镜头目录中的 `transcription.srt`，让渲染工具理解全文上下文。
 - 填写 `SCENE_ID`、`SCENE_DURATION_SECONDS`、`OUTPUT_FILE`、`FULL_TRANSCRIPT_PATH` 和 `SCENE_TEXT`。
 - 可改写 `PROMPT` 中的创意描述，使艺术方向和视觉概念贴合当前文案，但不能改动执行契约。
 - 要求输出 1080×1440、30fps、静音、无音轨的 MP4。
@@ -164,12 +164,12 @@ scenes/
 脚本的阶段性汇报和日志规则必须保留：
 
 - 只向外放行以 `[[USER_MESSAGE]]` 开头的消息。
-- 保留 `claude-<scene>.stream.jsonl`。
-- 保留 `claude-<scene>.stderr.log`。
-- 保留 `claude-<scene>.user.log`。
+- 保留 `render-<scene>.stream.jsonl`。
+- 保留 `render-<scene>.stderr.log`。
+- 保留 `render-<scene>.user.log`。
 - 阶段消息至少覆盖需求与素材检查、联网搜索、代码完成开始渲染、MP4 渲染完成。
 
-严格按镜头编号顺序执行，同一时间只运行一个 `run-claude-ai.sh`。
+严格按镜头编号顺序执行，同一时间只运行一个 `run-scene.sh`。
 
 如果一段时间没有新的 `[[USER_MESSAGE]]`，不要立即判定失败。先检查：
 
@@ -205,7 +205,7 @@ scenes/
 - 静音且没有音轨。
 - 可完整解码。
 
-规格不一致时生成规范化副本，保留 Claude AI 的原始 MP4。然后按镜头顺序拼接为 `production/silent-master.mp4`。
+规格不一致时生成规范化副本，保留渲染工具的原始 MP4。然后按镜头顺序拼接为 `production/silent-master.mp4`。
 
 只有一个镜头时，也必须复制或规范化为 `production/silent-master.mp4`。验证静音母版总帧数等于 `timing-report.json` 的总帧数。
 
@@ -296,7 +296,7 @@ scenes/
 - 最终配音对应的 `transcription-production.srt`。
 - `production/script-final.md` 和修改记录。
 - `production/input-manifest.json`、制作配置和时间报告。
-- 每个镜头的 Claude 日志、源项目证据和镜头 MP4。
+- 每个镜头的渲染日志、源项目证据和镜头 MP4。
 - 静音母版、音频 stems、cue sheet、素材账本和授权证据。
 - 视觉检查表、声音检查表、机器 QC 和审批文件。
 - 失败镜头的编号、失败阶段、关键日志和建议重试方式。

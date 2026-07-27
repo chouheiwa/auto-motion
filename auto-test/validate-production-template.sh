@@ -30,7 +30,7 @@ required_contracts=(
   'MiniMax'
   '\.env'
   '实际语音|真实.*时间戳'
-  '顺序.*Claude|Claude.*顺序'
+  '顺序.*渲染|渲染.*顺序'
   '\[\[USER_MESSAGE\]\]'
   'SCENE_DURATION_SECONDS'
   '第 0 帧|首帧'
@@ -56,12 +56,13 @@ if grep -Eiq '你是[^。]*(Codex|agent)|主控[[:space:]]*agent|执行(者|这�
   fail "PROMPT-PRODUCTION.md exposes an executor identity"
 fi
 
-git -C "$ROOT_DIR" diff --quiet main -- \
-  PROMPT.md \
-  exampleFolder/run-claude-ai.sh \
-  auto-test/run.sh \
-  auto-test/validate.sh \
-  || fail "the basic workflow contract changed"
+require_file "$ROOT_DIR/exampleFolder/run-scene.sh"
+require_pattern 'RENDERER' "$ROOT_DIR/exampleFolder/run-scene.sh" \
+  "run-scene.sh missing RENDERER dispatch"
+require_pattern 'render-' "$ROOT_DIR/auto-test/validate.sh" \
+  "validate.sh missing render- log prefix"
+require_pattern '渲染工具' "$ROOT_DIR/PROMPT.md" \
+  "PROMPT.md missing tool-agnostic 渲染工具 reference"
 
 for readme in "$ROOT_DIR/README.md" "$ROOT_DIR/README.en.md"; do
   require_pattern 'PROMPT\.md' "$readme" "$(basename "$readme") missing basic entry point"
