@@ -30,7 +30,7 @@ fi
 RENDERER="${RENDERER:-claude}"
 
 CODEX_SKILLS_HINT=""
-if [[ "$RENDERER" == "codex" ]]; then
+if [[ "$RENDERER" == "codex" || "$RENDERER" == "codebuddy" ]]; then
   CODEX_SKILLS_HINT="
 HyperFrames 技能文件位于 .claude/skills/ 目录。在开始实现前，请先阅读 .claude/skills/hyperframes/SKILL.md 了解 composition 结构和渲染规则。"
 fi
@@ -137,8 +137,28 @@ case "$RENDERER" in
     ' \
     | tee "$USER_LOG"
     ;;
+  codebuddy)
+    codebuddy -p \
+      --verbose \
+      --output-format stream-json \
+      -y \
+      "$PROMPT" \
+      2>"$STDERR_LOG" \
+    | tee "$RAW_LOG" \
+    | jq -Rr --unbuffered '
+      fromjson?
+      | select(.type=="assistant")
+      | .message.content[]?
+      | select(.type=="text")
+      | .text
+      | split("\n")[]
+      | select(startswith("[[USER_MESSAGE]]"))
+      | sub("^\\[\\[USER_MESSAGE\\]\\]"; "")
+    ' \
+    | tee "$USER_LOG"
+    ;;
   *)
-    echo "未知的 RENDERER: $RENDERER（可选：claude, qoder, codex）" >&2
+    echo "未知的 RENDERER: $RENDERER（可选：claude, qoder, codex, codebuddy）" >&2
     exit 1
     ;;
 esac

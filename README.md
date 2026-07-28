@@ -68,12 +68,12 @@ qwen 3.8则负责写react代码
 
 ### 1. 配置层：auto-motion.conf
 
-`auto-motion.conf` 定义编排工具和渲染工具的组合。编排层和渲染层都可以从 Codex、Claude Code、Qoder 中三选一，但同一个工具不能同时担任两个角色。
+`auto-motion.conf` 定义编排工具和渲染工具的组合。编排层和渲染层都可以从 Codex、Claude Code、Qoder、CodeBuddy 中四选一，但同一个工具不能同时担任两个角色。
 
 ```bash
-# 编排工具：codex | claude | qoder
+# 编排工具：codex | claude | qoder | codebuddy
 ORCHESTRATOR=codex
-# 渲染工具：codex | claude | qoder（必须与 ORCHESTRATOR 不同）
+# 渲染工具：codex | claude | qoder | codebuddy（必须与 ORCHESTRATOR 不同）
 RENDERER=claude
 ```
 
@@ -108,7 +108,7 @@ RENDERER=claude
 
 ### 4. 动画层：HyperFrames
 
-`exampleFolder/.claude/skills/` 中包含 HyperFrames 相关技能。Claude Code 渲染时自动发现这些技能；Qoder 使用内置 HyperFrames 技能；Codex 渲染时由 `run-scene.sh` 在提示词中引用技能文件。渲染工具基于这些技能编写 HTML 动画项目，并渲染 1080x1440、30fps、静音、无音轨的 MP4。
+`exampleFolder/.claude/skills/` 中包含 HyperFrames 相关技能。Claude Code 渲染时自动发现这些技能；Qoder 使用内置 HyperFrames 技能；Codex 与 CodeBuddy 渲染时由 `run-scene.sh` 在提示词中引用技能文件。渲染工具基于这些技能编写 HTML 动画项目，并渲染 1080x1440、30fps、静音、无音轨的 MP4。
 
 ### 5. 验收层：auto-test
 
@@ -128,6 +128,7 @@ RENDERER=claude
 - [Codex CLI](https://developers.openai.com/codex/cli)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 - [QoderCN CLI](https://help.aliyun.com/document_detail/3033350.html)
+- [CodeBuddy Code](https://www.codebuddy.cn)
 - Node.js 22 或更高版本
 - FFmpeg 和 FFprobe
 - `jq`
@@ -139,6 +140,7 @@ RENDERER=claude
 codex --version
 claude --version
 qoderclicn --version
+codebuddy --version
 node --version
 ffmpeg -version
 ffprobe -version
@@ -231,7 +233,7 @@ bash auto-test/validate-production-template.sh
 ├── PROMPT-PRODUCTION.md           # 从稿件到带声音成片的完整流程
 ├── transcription.srt              # 输入字幕文件
 ├── exampleFolder/
-│   ├── run-scene.sh               # 单镜头渲染模板（支持 claude/qoder/codex）
+│   ├── run-scene.sh               # 单镜头渲染模板（支持 claude/qoder/codex/codebuddy）
 │   ├── run-claude-ai.sh           # 旧版 Claude Code 专用模板（保留兼容）
 │   └── .claude/skills/            # HyperFrames 相关技能
 ├── auto-test/

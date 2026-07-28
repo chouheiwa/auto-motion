@@ -68,12 +68,12 @@ Below is a screenshot from a real run: a multi-scene job has been running for 1 
 
 ### 1. Configuration: auto-motion.conf
 
-`auto-motion.conf` defines the orchestrator and renderer combination. Both layers can use any of Codex, Claude Code, or Qoder, but the same tool cannot serve as both.
+`auto-motion.conf` defines the orchestrator and renderer combination. Both layers can use any of Codex, Claude Code, Qoder, or CodeBuddy, but the same tool cannot serve as both.
 
 ```bash
-# Orchestrator: codex | claude | qoder
+# Orchestrator: codex | claude | qoder | codebuddy
 ORCHESTRATOR=codex
-# Renderer: codex | claude | qoder (must differ from ORCHESTRATOR)
+# Renderer: codex | claude | qoder | codebuddy (must differ from ORCHESTRATOR)
 RENDERER=claude
 ```
 
@@ -108,7 +108,7 @@ The script dispatches to the configured renderer CLI and requires fixed progress
 
 ### 4. Motion Authoring: HyperFrames
 
-`exampleFolder/.claude/skills/` contains the HyperFrames skills. Claude Code auto-discovers them; Qoder uses its built-in HyperFrames skills; Codex reads them via prompt references in `run-scene.sh`. The renderer writes an HTML animation project with those skills and renders a 1080x1440, 30fps, silent MP4 with no audio track.
+`exampleFolder/.claude/skills/` contains the HyperFrames skills. Claude Code auto-discovers them; Qoder uses its built-in HyperFrames skills; Codex and CodeBuddy read them via prompt references in `run-scene.sh`. The renderer writes an HTML animation project with those skills and renders a 1080x1440, 30fps, silent MP4 with no audio track.
 
 ### 5. Validation: auto-test
 
@@ -128,6 +128,7 @@ Install and sign in to **at least two** of the following tools (one for orchestr
 - [Codex CLI](https://developers.openai.com/codex/cli)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 - [QoderCN CLI](https://help.aliyun.com/document_detail/3033350.html)
+- [CodeBuddy Code](https://www.codebuddy.cn)
 - Node.js 22 or newer
 - FFmpeg and FFprobe
 - `jq`
@@ -139,6 +140,7 @@ Run these checks before starting:
 codex --version
 claude --version
 qoderclicn --version
+codebuddy --version
 node --version
 ffmpeg -version
 ffprobe -version
@@ -231,7 +233,7 @@ bash auto-test/validate-production-template.sh
 ├── PROMPT-PRODUCTION.md           # Complete script-to-scored-video workflow
 ├── transcription.srt              # Input transcript
 ├── exampleFolder/
-│   ├── run-scene.sh               # Single-scene renderer template (claude/qoder/codex)
+│   ├── run-scene.sh               # Single-scene renderer template (claude/qoder/codex/codebuddy)
 │   ├── run-claude-ai.sh           # Legacy Claude Code template (kept for compat)
 │   └── .claude/skills/            # HyperFrames skills
 ├── auto-test/

@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-_AM_VALID_TOOLS="codex claude qoder"
+_AM_VALID_TOOLS="codex claude qoder codebuddy"
 
 am_load_config() {
   local root="${AM_ROOT:-.}"
@@ -39,6 +39,7 @@ am_tool_binary() {
     codex)  echo "codex" ;;
     claude) echo "claude" ;;
     qoder)  echo "qoderclicn" ;;
+    codebuddy) echo "codebuddy" ;;
     *)      echo "unknown tool: $1" >&2; exit 1 ;;
   esac
 }
@@ -75,6 +76,10 @@ am_run_orchestrator() {
       qoderclicn -p "$(cat "$prompt_file")" \
         --dangerously-skip-permissions \
         --output-format stream-json
+      ;;
+    codebuddy)
+      codebuddy -p "$(cat "$prompt_file")" \
+        -y
       ;;
   esac
 }
@@ -124,6 +129,16 @@ am_run_renderer() {
         --sandbox danger-full-access \
         --ask-for-approval never \
         --json \
+        "$prompt" \
+        2>"$stderr_log" \
+      | tee "$raw_log" \
+      | jq -Rr --unbuffered "$(am_render_jq_filter)"
+      ;;
+    codebuddy)
+      codebuddy -p \
+        --verbose \
+        --output-format stream-json \
+        -y \
         "$prompt" \
         2>"$stderr_log" \
       | tee "$raw_log" \
