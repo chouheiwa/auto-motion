@@ -35,6 +35,8 @@
 
 不得修改或删除原始输入。正式制作开始后创建 `production/`，记录输入清单、SHA-256、配置和所有审批证据。不得覆盖归属不明的旧产物；本次盘点未发现已有 `production/`、`scenes/` 或 `final.mp4`。
 
+`.env` 必须保持在 Git 忽略规则内。开始 TTS 前必须通过 `git check-ignore .env` 验证，不得暂存、提交、复制到制作证据，或把任何凭据值写入命令行、Markdown、JSON 和日志。
+
 ## 内容设计
 
 终稿控制在约 750–850 个汉字，预计结构如下：
@@ -78,13 +80,27 @@ MiniMax 凭据只从项目根目录 `.env` 读取。日志仅记录变量是否�
 - 覆盖连续帧区间。
 - 与前后镜头首尾相接。
 - 从 `exampleFolder` 复制 `.claude/` 和 `run-scene.sh`。
-- 携带完整 `transcription-production.srt`。
-- 只调整镜头编号、时长、输出名、字幕路径、镜头文案和创意提示。
+- 把完整 `transcription-production.srt` 复制为镜头目录内的 `transcription.srt`。
+- 明确填写 `SCENE_ID`、`SCENE_DURATION_SECONDS`、`OUTPUT_FILE`、`FULL_TRANSCRIPT_PATH` 和 `SCENE_TEXT`。
+- 只调整上述变量和 `PROMPT` 中的创意描述，不改变非交互运行、日志过滤、输出和错误处理契约。
 - 输出 1080×1440、30fps、H.264、`yuv420p`、静音且无音轨的 MP4。
 
 统一提示词只约束语义重点和“清晰系统蓝图”艺术方向，不替渲染工具设计镜头内部 MG 动效。
 
 严格按镜头编号单线程执行 `run-scene.sh`。每次调用保留流日志、错误日志和用户消息日志。失败重试使用新的 attempt 目录，不覆盖失败证据。
+
+日志只能向外放行以 `[[USER_MESSAGE]]` 开头的消息，并保留：
+
+- `render-<scene>.stream.jsonl`
+- `render-<scene>.stderr.log`
+- `render-<scene>.user.log`
+
+每次渲染至少出现以下四类阶段消息，文字保持执行脚本约定：
+
+- 需求理解和素材检查已完成。
+- 开始联网搜索。
+- 代码已完成，开始渲染。
+- 视频已渲染完成并带输出文件名。
 
 ## 视觉设计与验收
 
@@ -122,7 +138,30 @@ BGM 为低密度电子氛围，稳定脉冲，不使用强鼓点，不做赛博�
 
 人工试听必须记录耳机和手机外放结果。若无法操作物理设备，两项均标为“未执行”，不得假称通过。
 
-只有 `production/approval.json` 绑定的检查全部通过，才允许在根目录原子生成 `final.mp4`。交付后再次核验哈希、规格和完整解码。
+无法代做的物理设备试听属于“发布前人工事项”，不阻止生成技术验收通过的 `final.mp4`，但 `approval.json` 必须把机器审批状态与发布审批状态分开记录：机器审批可以通过，发布审批保持 `pending_manual_listening`。最终汇报必须醒目标出发布前仍需补做耳机和手机外放完整试听，不得宣称已可直接发布。
+
+只有 `production/approval.json` 绑定的机器检查全部通过，且除已明确允许挂起的物理试听外不存在其他失败项，才允许在根目录原子生成 `final.mp4`。交付后再次核验哈希、规格和完整解码。
+
+## 强制产物与最低内容
+
+| 阶段 | 强制产物 | 最低内容 |
+| --- | --- | --- |
+| 输入盘点 | `production/input-inventory.md` | 文章、Markdown、TXT、SRT、音频、图片、视频和视觉参考的归类与用途判断 |
+| 输入冻结 | `production/input-manifest.json` | 每个原始输入的相对路径、字节数、SHA-256 和记录时间 |
+| 制作配置 | `production/production-config.json` | 项目标识、输入、平台、画幅、帧率、稿件状态、SRT 性质、配音状态、音色方向、开场、封面标题与行数、稳定帧数、BGM/SFX 方向 |
+| 稿件 | `production/script-final.md`、`production/script-change-log.md` | 最终口播、开场、删改重排记录、专有名词保护清单 |
+| TTS 证据 | `production/tts/` | 试听与正式请求参数、去敏响应、原始音频、服务时间戳、生成报告和发音检查 |
+| 真实时间轴 | `transcription-production.srt`、`production/timing-report.json` | 帧率、总帧数、总时长、采样率、每声道目标采样数、所有字幕、无文字区间、参考 SRT 时长差 |
+| 分镜 | `production/scene-plan.json`、`production/scene-plan.md` | 每镜头编号、首尾帧、秒级时长、字幕范围、文案、语义目的，以及帧数和时长总和检查 |
+| 镜头证据 | `scenes/scene-*/` | `.claude/`、`run-scene.sh`、`transcription.srt`、源项目、原始 MP4、规范化 MP4（如需）和三类日志 |
+| 视觉验收 | `production/visual-qc/` | 第 0 帧、转场开始帧、转场中代表帧截图，检查表、问题和修复记录 |
+| 静音母版 | `production/silent-master.mp4` | 与冻结总帧数完全一致、统一规格、无音轨 |
+| 音频资产 | `production/audio/asset-ledger.json`、授权证据 | 文件名、用途、URL、作者、素材 ID、授权、下载时间、SHA-256、署名要求 |
+| 声音定位 | `production/audio/cue-sheet.json` | 素材、开始帧、持续帧、采样点、增益、淡入淡出和用途 |
+| 声音母版 | `production/audio/voice.wav`、`music.wav`、`sfx.wav`、`premaster.wav` | 48kHz 双声道、精确目标采样数 |
+| 候选与 QC | `production/audio/candidate.mp4`、`machine-qc.json`、`sound-checklist.json` | 规格、帧数、采样数、解码、响度、峰值、边界检查和人工试听状态 |
+| 审批 | `production/approval.json` | 输入、候选、检查文件和最终文件哈希；机器审批和发布审批分离 |
+| 最终交付 | 根目录 `final.mp4` | 原子生成后再次记录 SHA-256、规格和完整解码结果 |
 
 ## 错误处理
 
