@@ -39,6 +39,12 @@
 
 缺少文章、口播稿、参考字幕或已有配音中的全部内容时，停止并明确列出缺失输入。
 
+### 发布配置生命周期
+
+平台、终稿和封面方向冻结后，立即参考 `templates/publish.md` 在根目录生成首版 `publish.md`，状态通常为 `draft`。文档必须以安全 YAML frontmatter 提供机器字段，并以固定 Markdown 章节提供人工可复制内容；不得把通用模板或其他作品的发布文案直接当成项目结果。
+
+如果将替换已有 `final.mp4`，必须先保留旧视频哈希并把 `video.replacement_in_progress: true`，以 `video_replacement_in_progress` 将现有发布配置原子刷新为 `blocked`。该保护状态优先于封面未确认或人工检查待完成。
+
 ## 第二阶段：整理口播稿和开场
 
 根据原文整理适合朗读的 `production/script-final.md`：
@@ -298,9 +304,22 @@ scenes/
 - 使用同文件系统内的临时文件和原子重命名生成根目录 `final.mp4`。
 - 原子替换后再次检查 `final.mp4` 的哈希、规格和完整解码。
 
+## 第十二阶段：刷新发布配置
+
+最终交付后刷新根目录 `publish.md`：
+
+- 用 FFprobe、完整解码和 SHA-256 实测 `final.mp4`，填入实际规格和最终哈希；新视频与新哈希验证完成后才把 `video.replacement_in_progress` 恢复为 `false`。
+- 从真实项目文件填入发布平台、主标题、介绍、话题、已确认封面文字、素材署名和 evidence。署名必须由素材账本和授权证据支持，不得凭印象补写。
+- 读取 `production/approval.json` 的 `expected_delivery.sha256`，并在存在时校验 `delivery_verification.actual_sha256`。它们必须与 `publish.md` 和实际成片哈希一致。
+- 将耳机、手机外放、封面预览、版权确认四项人工检查写入 `manual_checks`；机器检查不能代替人工检查。
+- 按合同计算且只使用 `draft`、`pending_manual_checks`、`blocked`、`ready`。没有成片或非人工字段/证据缺失时用 `draft`；替换、解码、哈希、规格、审批、失败检查或署名证据异常时用 `blocked`；只有非人工信息完整且仍有适用检查待执行时才用 `pending_manual_checks`。
+- YAML 使用 `yaml.safe_dump` 安全序列化。先在与目标文件同一文件系统写临时文件，执行 `python3 production/tools/validate_publish.py <临时文件> --project-root .`，验证通过后才原子重命名为 `publish.md`。
+- 不得用无效临时文档覆盖最后一个有效 `publish.md`。如果无法构造合同有效的状态文档，保留旧文件并在最终汇报中明确刷新失败，绝不声称 `ready`。
+
 ## 最终交付清单
 
 - 根目录 `final.mp4`。
+- 根目录 `publish.md`，包含最终发布文案、成片 SHA-256、证据索引、署名和人工待办。
 - 最终配音对应的 `transcription-production.srt`。
 - `production/script-final.md` 和修改记录。
 - `production/input-manifest.json`、制作配置和时间报告。
@@ -310,4 +329,4 @@ scenes/
 - 失败镜头的编号、失败阶段、关键日志和建议重试方式。
 - 发布所需的音乐或素材署名文字。
 
-完成时汇报最终成片路径、时长、分辨率、帧率、音频规格、SHA-256、所有检查结果，以及仍需人工完成的发布前事项。
+完成时汇报最终成片路径、`publish.md` 路径、时长、分辨率、帧率、音频规格、SHA-256、发布状态、所有检查结果，以及仍需人工完成的发布前事项。

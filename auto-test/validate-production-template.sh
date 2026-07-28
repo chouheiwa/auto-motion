@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRODUCTION_PROMPT="$ROOT_DIR/PROMPT-PRODUCTION.md"
+BASIC_PROMPT="$ROOT_DIR/PROMPT.md"
+PUBLISH_TEMPLATE="$ROOT_DIR/templates/publish.md"
+PUBLISH_VALIDATOR="$ROOT_DIR/production/tools/validate_publish.py"
 
 fail() {
   echo "production-template FAIL: $*" >&2
@@ -22,6 +25,12 @@ require_pattern() {
 }
 
 require_file "$PRODUCTION_PROMPT"
+require_file "$BASIC_PROMPT"
+require_file "$PUBLISH_TEMPLATE"
+require_file "$PUBLISH_VALIDATOR"
+
+python3 "$PUBLISH_VALIDATOR" "$PUBLISH_TEMPLATE" --template ||
+  fail "publish template validation failed"
 
 required_contracts=(
   '一次性项目|单次项目'
@@ -51,6 +60,56 @@ for pattern in "${required_contracts[@]}"; do
     "PROMPT-PRODUCTION.md missing contract: $pattern"
 done
 
+publish_contracts=(
+  'publish\.md'
+  'templates/publish\.md'
+  'SHA-256'
+  '同一文件系统'
+  'yaml\.safe_dump'
+  '临时文件'
+  '验证通过.*原子重命名|原子重命名.*验证通过'
+  'production/tools/validate_publish\.py'
+  '汇报.*失败|失败.*汇报'
+)
+
+for prompt in "$BASIC_PROMPT" "$PRODUCTION_PROMPT"; do
+  for pattern in "${publish_contracts[@]}"; do
+    require_pattern "$pattern" "$prompt" \
+      "$(basename "$prompt") missing publish contract: $pattern"
+  done
+done
+
+production_publish_contracts=(
+  'expected_delivery\.sha256'
+  '素材账本.*授权证据|授权证据.*素材账本'
+  '耳机'
+  '手机外放'
+  '封面预览'
+  '版权确认'
+  'draft'
+  'pending_manual_checks'
+  'blocked'
+  'ready'
+)
+
+for pattern in "${production_publish_contracts[@]}"; do
+  require_pattern "$pattern" "$PRODUCTION_PROMPT" \
+    "PROMPT-PRODUCTION.md missing publish contract: $pattern"
+done
+
+basic_publish_contracts=(
+  'workflow: basic_srt'
+  'unspecified'
+  'generated_candidate'
+  'no_audio_track'
+  '证据.*空值|不存在.*证据'
+)
+
+for pattern in "${basic_publish_contracts[@]}"; do
+  require_pattern "$pattern" "$BASIC_PROMPT" \
+    "PROMPT.md missing publish contract: $pattern"
+done
+
 if grep -Eiq '你是[^。]*(Codex|agent)|主控[[:space:]]*agent|执行(者|这份说明)[^。]*(Codex|agent)' \
   "$PRODUCTION_PROMPT"; then
   fail "PROMPT-PRODUCTION.md exposes an executor identity"
@@ -70,6 +129,15 @@ for readme in "$ROOT_DIR/README.md" "$ROOT_DIR/README.en.md"; do
     "$(basename "$readme") missing production entry point"
   require_pattern 'worktree|干净目录|clean directory' "$readme" \
     "$(basename "$readme") missing one-run isolation guidance"
+  require_pattern 'publish\.md' "$readme" "$(basename "$readme") missing publish.md"
+  require_pattern 'templates/publish\.md' "$readme" \
+    "$(basename "$readme") missing publish template"
+  require_pattern 'publish_status' "$readme" \
+    "$(basename "$readme") missing publish status"
+  require_pattern 'validate_publish\.py' "$readme" \
+    "$(basename "$readme") missing publish validator command"
+  require_pattern 'ready.*(不|does not|not mean).*(发布|published)' "$readme" \
+    "$(basename "$readme") missing ready-state caveat"
 done
 
 echo "production-template PASS: full and basic workflow contracts are intact."

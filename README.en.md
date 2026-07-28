@@ -10,8 +10,8 @@
 
 | Entry point | Use it when | Deliverables |
 | --- | --- | --- |
-| [`PROMPT.md`](./PROMPT.md) | You already have a final `transcription.srt` and only need silent MG animation | Scene MP4s, Claude logs, and a silent `final.mp4` |
-| [`PROMPT-PRODUCTION.md`](./PROMPT-PRODUCTION.md) | You are starting from an article, spoken script, or reference SRT and need narration plus complete sound | Final script, TTS, speech-derived SRT, scenes, cover, BGM/SFX, mixed video, and audit evidence |
+| [`PROMPT.md`](./PROMPT.md) | You already have a final `transcription.srt` and only need silent MG animation | Scene MP4s, render logs, a silent `final.mp4`, and `publish.md` |
+| [`PROMPT-PRODUCTION.md`](./PROMPT-PRODUCTION.md) | You are starting from an article, spoken script, or reference SRT and need narration plus complete sound | Final script, TTS, speech-derived SRT, scenes, cover, BGM/SFX, mixed video, `publish.md`, and audit evidence |
 
 Both entry points share the same single-scene Claude Code execution template. `PROMPT-PRODUCTION.md` adds script, narration, pacing, cover, and sound-production gates without changing the lightweight behavior of `PROMPT.md`.
 
@@ -183,6 +183,7 @@ scenes/
   scene-002/
     scene-002.mp4
 final.mp4
+publish.md
 ```
 
 ### 3. Run the complete production workflow
@@ -195,7 +196,7 @@ bash run-orchestrator.sh PROMPT-PRODUCTION.md
 
 The production workflow has four human review gates: spoken script and opening, TTS voice and phrasing, frame-zero cover, and headphone plus phone-speaker listening. A run may stop at a review gate and continue in the same worktree; do not create a different project or import another production's artifacts.
 
-In addition to `final.mp4`, the audit trail is stored in `production/`, and the final narration subtitles are written to `transcription-production.srt`.
+In addition to `final.mp4`, the audit trail is stored in `production/`, the final narration subtitles are written to `transcription-production.srt`, and publishing configuration is written to root `publish.md`.
 
 ### 4. Open the result
 
@@ -203,6 +204,14 @@ The final video is written to the repository root:
 
 ```bash
 open final.mp4
+```
+
+The adjacent `publish.md` is a separate publishing deliverable: YAML frontmatter is machine-readable, while the Markdown body lets a publisher copy the title, introduction, hashtags, cover text, and credits. `publish_status` may be `draft`, `pending_manual_checks`, `blocked`, or `ready`; `ready` does not mean the video has already been published.
+
+The reusable draft is [`templates/publish.md`](./templates/publish.md). Validate a project file with:
+
+```bash
+python3 production/tools/validate_publish.py publish.md --project-root .
 ```
 
 ## Test
@@ -221,6 +230,12 @@ Validate the static contract for the complete production template:
 bash auto-test/validate-production-template.sh
 ```
 
+Run the publishing-contract unit tests with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest production/tests/test_publish_contract.py -v
+```
+
 ## Repository Layout
 
 ```text
@@ -231,6 +246,8 @@ bash auto-test/validate-production-template.sh
 │   └── auto-motion.sh             # Shared shell library (CLI dispatch)
 ├── PROMPT.md                      # Basic silent workflow for an existing SRT
 ├── PROMPT-PRODUCTION.md           # Complete script-to-scored-video workflow
+├── templates/
+│   └── publish.md                 # Reusable publishing-config draft
 ├── transcription.srt              # Input transcript
 ├── exampleFolder/
 │   ├── run-scene.sh               # Single-scene renderer template (claude/qoder/codex/codebuddy)
@@ -241,8 +258,10 @@ bash auto-test/validate-production-template.sh
 │   ├── validate.sh                # Video validation script
 │   ├── validate-production-template.sh # Production-template contract check
 │   └── transcription.srt          # Test transcript
-├── production/                    # Per-run config, audio, and audit evidence
-└── final.mp4                      # Generated delivery video
+├── production/                    # Production tools, tests, and per-run evidence
+│   └── tools/validate_publish.py  # Read-only publish.md validator
+├── final.mp4                      # Generated delivery video
+└── publish.md                     # Generated publishing config (not tracked on generic main)
 ```
 
 ## Notes
@@ -252,3 +271,4 @@ bash auto-test/validate-production-template.sh
 - If a scene fails, inspect its `stderr.log`, `stream.jsonl`, and `user.log` first.
 - If scene video specs differ, normalize them before stitching.
 - Machine audio checks in the complete workflow do not replace a final headphone and phone-speaker listening pass.
+- `publish.md` must bind the actual `final.mp4` SHA-256. Generic `main` tracks only the template and validator, never a per-video publishing file.

@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 forbidden_patterns=(
   '^final\.mp4$'
+  '^publish\.md$'
   '^transcription-production\.srt$'
   '^scenes/'
   '^production/approval[^/]*\.json$'

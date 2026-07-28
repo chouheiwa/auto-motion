@@ -39,6 +39,18 @@
 
 只有在进程退出失败，或长时间无日志、无文件更新且无渲染进程时，才判定该镜头失败并记录失败原因。
 
+## 发布配置交付
+
+除视频外，根目录必须交付 `publish.md`。以 `templates/publish.md` 为结构参考，但不得把模板当成已经填写的项目结果。
+
+- 完成字幕分析后先生成 `workflow: basic_srt` 的草稿。标题、介绍、话题和封面候选必须来自完整终稿 SRT；平台未知时写 `unspecified`。
+- 封面只可标记为用户已确认的 `confirmed_config`、第 0 帧实测得到的 `detected_frame_zero`，或尚待确认的 `generated_candidate`。候选未确认时保持 `draft`。
+- 最终视频为静音时写 `audio_codec: none`，耳机和手机外放检查使用 `not_applicable` 与 `no_audio_track`。不存在的审批、账本或检查证据保持空值或 `pending`，并在未完成事项中明确列出。
+- 如果将替换已有 `final.mp4`，先保留旧哈希，将 `video.replacement_in_progress: true`，以 `video_replacement_in_progress` 原子刷新为有效 `blocked` 文档；新视频、最终 SHA-256 和规格全部验证后才能恢复为 `false`。
+- 使用 FFprobe 和完整解码读取实际成片规格并计算最终 SHA-256。没有成片时保留包含 `final_video_missing` 的有效 `draft`；成片无法解码或存在哈希/规格异常时，生成含对应诊断的有效 `blocked` 文档。
+- YAML frontmatter 必须用 `yaml.safe_dump` 安全序列化，不得拼接未转义外部文本。临时文件与 `publish.md` 必须位于同一文件系统。
+- 每次生成或刷新都先对临时文件执行 `python3 production/tools/validate_publish.py <临时文件> --project-root .`；只有验证通过后才原子重命名为根目录 `publish.md`。无效临时文件不得替换现有文件；保留最后一个有效版本，汇报刷新失败，且不得声称 `ready`。
+
 ## 最终交付
 
 所有镜头 mp4 完成后，使用 ffmpeg 按镜头顺序拼接为 `final.mp4`。拼接前确认每个镜头满足统一规格；如规格不一致，先转码规范化。只有一个镜头时，也需要将该镜头 mp4 复制或转码为 `final.mp4`。
@@ -47,4 +59,5 @@
 
 - 每个镜头目录中的渲染日志和镜头 mp4。
 - 拼接后的 `final.mp4`。
+- 根目录 `publish.md`，包含实际成片规格、最终 SHA-256、发布文案和未完成事项。
 - 如有失败，提供失败镜头编号、失败阶段、关键日志和建议重试方式。

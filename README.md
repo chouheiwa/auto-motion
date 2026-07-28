@@ -10,8 +10,8 @@
 
 | 入口 | 适用情况 | 交付结果 |
 | --- | --- | --- |
-| [`PROMPT.md`](./PROMPT.md) | 已有定稿 `transcription.srt`，只需要制作静音 MG 动画 | 分镜 MP4、Claude 日志、静音 `final.mp4` |
-| [`PROMPT-PRODUCTION.md`](./PROMPT-PRODUCTION.md) | 从文章、口播稿或参考 SRT 开始，需要配音和完整声音制作 | 终稿、TTS、真实 SRT、分镜、封面、BGM/SFX、混音成片和验收证据 |
+| [`PROMPT.md`](./PROMPT.md) | 已有定稿 `transcription.srt`，只需要制作静音 MG 动画 | 分镜 MP4、渲染日志、静音 `final.mp4` 和 `publish.md` |
+| [`PROMPT-PRODUCTION.md`](./PROMPT-PRODUCTION.md) | 从文章、口播稿或参考 SRT 开始，需要配音和完整声音制作 | 终稿、TTS、真实 SRT、分镜、封面、BGM/SFX、混音成片、`publish.md` 和验收证据 |
 
 两个入口共享同一个单镜头 Claude Code 执行模板。`PROMPT-PRODUCTION.md` 在基础流程外增加了稿件、配音、节奏、封面和声音制作关卡，不会改变 `PROMPT.md` 的轻量行为。
 
@@ -183,6 +183,7 @@ scenes/
   scene-002/
     scene-002.mp4
 final.mp4
+publish.md
 ```
 
 ### 3. 执行完整制作流程
@@ -195,7 +196,7 @@ bash run-orchestrator.sh PROMPT-PRODUCTION.md
 
 完整流程包含四个人工审核点：口播稿与开场、TTS 音色与断句、首帧封面、耳机与手机外放试听。一次执行在审核点结束后，可以在同一 worktree 中继续；不要另建项目或复用其他作品的产物。
 
-除 `final.mp4` 外，制作证据保存在 `production/`，最终配音字幕为 `transcription-production.srt`。
+除 `final.mp4` 外，制作证据保存在 `production/`，最终配音字幕为 `transcription-production.srt`，发布配置写入根目录 `publish.md`。
 
 ### 4. 查看结果
 
@@ -203,6 +204,14 @@ bash run-orchestrator.sh PROMPT-PRODUCTION.md
 
 ```bash
 open final.mp4
+```
+
+同目录的 `publish.md` 是独立的发布配置交付：YAML frontmatter 供工具读取，Markdown 正文供发布者复制标题、介绍、话题、封面文字和署名。`publish_status` 可为 `draft`、`pending_manual_checks`、`blocked` 或 `ready`；`ready` 仅表示文件与配置已准备好，不表示已经发布到平台。
+
+通用草稿见 [`templates/publish.md`](./templates/publish.md)。项目文件可用以下命令校验：
+
+```bash
+python3 production/tools/validate_publish.py publish.md --project-root .
 ```
 
 ## 测试
@@ -221,6 +230,12 @@ bash auto-test/run.sh
 bash auto-test/validate-production-template.sh
 ```
 
+发布配置契约的单元测试：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest production/tests/test_publish_contract.py -v
+```
+
 ## 目录说明
 
 ```text
@@ -231,6 +246,8 @@ bash auto-test/validate-production-template.sh
 │   └── auto-motion.sh             # 共享 shell 库（CLI 分发）
 ├── PROMPT.md                      # 已有 SRT 的基础静音流程
 ├── PROMPT-PRODUCTION.md           # 从稿件到带声音成片的完整流程
+├── templates/
+│   └── publish.md                 # 可复用发布配置草稿
 ├── transcription.srt              # 输入字幕文件
 ├── exampleFolder/
 │   ├── run-scene.sh               # 单镜头渲染模板（支持 claude/qoder/codex/codebuddy）
@@ -241,8 +258,10 @@ bash auto-test/validate-production-template.sh
 │   ├── validate.sh                # 视频产物校验脚本
 │   ├── validate-production-template.sh # 完整模板合同检查
 │   └── transcription.srt          # 测试字幕
-├── production/                    # 单次完整制作的配置、音频和验收证据
-└── final.mp4                      # 生成后的视频交付文件
+├── production/                    # 制作工具、测试及单次制作证据目录
+│   └── tools/validate_publish.py  # publish.md 只读校验器
+├── final.mp4                      # 生成后的视频交付文件
+└── publish.md                     # 生成后的发布配置（不进入通用 main）
 ```
 
 ## 注意事项
@@ -252,3 +271,4 @@ bash auto-test/validate-production-template.sh
 - 若某个镜头失败，优先查看对应目录下的 `stderr.log`、`stream.jsonl` 和 `user.log`。
 - 如果视频规格不一致，应先统一转码后再拼接。
 - 完整制作流程中的机器声音检查不能代替发布前的耳机和手机外放试听。
+- `publish.md` 必须绑定实际 `final.mp4` 的 SHA-256；通用 `main` 只保存模板和校验器，不保存单片发布配置。
