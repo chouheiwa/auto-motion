@@ -187,7 +187,7 @@ final.mp4
 
 ### 3. 执行完整制作流程
 
-准备文章、口播稿和参考 SRT，并在项目根目录的 `.env` 中配置 MiniMax TTS 凭据。然后运行：
+准备文章、口播稿和参考 SRT，并先用 `mmx auth login --api-key sk-xxxxx` 完成 MiniMax CLI（Token Plan）鉴权。然后运行：
 
 ```bash
 bash run-orchestrator.sh PROMPT-PRODUCTION.md

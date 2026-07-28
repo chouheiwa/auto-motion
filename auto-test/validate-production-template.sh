@@ -28,7 +28,7 @@ required_contracts=(
   '干净目录|独立 worktree'
   '文章|口播稿'
   'MiniMax'
-  '\.env'
+  'mmx auth|~/\.mmx'
   '实际语音|真实.*时间戳'
   '顺序.*渲染|渲染.*顺序'
   '\[\[USER_MESSAGE\]\]'

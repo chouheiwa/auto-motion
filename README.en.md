@@ -187,7 +187,7 @@ final.mp4
 
 ### 3. Run the complete production workflow
 
-Place the article, spoken script, or reference SRT in the project and configure the MiniMax TTS credentials in the root `.env`. Then run:
+Place the article, spoken script, or reference SRT in the project, then authenticate with the MiniMax CLI (Token Plan) via `mmx auth login --api-key sk-xxxxx`. Then run:
 
 ```bash
 bash run-orchestrator.sh PROMPT-PRODUCTION.md

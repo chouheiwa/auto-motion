@@ -68,18 +68,26 @@
 
 ### 凭据与配置
 
-- 从项目根目录的 `.env` 读取 MiniMax TTS 所需凭据。
-- 推荐使用 `MINIMAX_API_KEY`、`MINIMAX_GROUP_ID`、`MINIMAX_TTS_MODEL` 和 `MINIMAX_VOICE_ID`；如果项目已有不同命名，以现有脚本或 `.env.example` 为准。
-- 日志只能记录变量是否存在，不能打印变量值、请求认证头或包含密钥的 URL。
-- `.env` 必须被 Git 忽略。
+- 配音通过 `mmx` CLI（MiniMax Token Plan）生成，不再直接调用原始 HTTP API。
+- 先确认已登录：`mmx auth status`；未登录时用 `mmx auth login --api-key sk-xxxxx` 完成鉴权。
+- 凭据保存在用户目录 `~/.mmx/config.json`，不进入项目目录，也不写入脚本、Markdown、JSON、命令行参数或日志。
+- 密钥（sk-xxxxx）只存在于登录命令与 `~/.mmx/config.json`，不得写入项目 `.env`、脚本、Markdown、JSON、命令行参数或日志；日志只能记录是否已登录、额度等状态，不得打印密钥值或包含密钥的 URL。
+- 若登录后调用报 401，用 `mmx config set --key region --value cn`（国内版）或 `global`（海外版）手动指定服务区域，再用 `mmx auth status` 确认。
+- 用 `mmx quota` 查看 Token Plan 剩余额度。
 
 ### 试听和正式生成
 
-- 音色尚未确定时，使用同一段 10–20 秒代表性文案生成 2–3 个试听版本，文件名包含音色 ID。
-- 音色、语速和情绪确认后再生成正式配音。
+- 音色尚未确定时，先用 `mmx speech voices` 列出可用音色，选择中文（普通话）真诚成年男声对应的 voice ID，记录到 `production/production-config.json` 的 `ttsVoiceId`。
+- 用同一段 10–20 秒代表性文案生成 2–3 个试听版本（`--out production/audio/try-<voiceId>.wav`），文件名包含 voice ID。
+- 音色、语速确认后再生成正式配音。
+- 固定参数：模型 `--model speech-2.8-hd`（CLI 默认值，即本项目要求的模型）、语速 `--speed 0.98`、音量 `--volume 1`、音高 `--pitch 0`。情绪由音色本身表达（`mmx` 不提供 `emotion` 参数），选择偏平静、真诚的音色，不通过变调模拟。
+- 需要 48kHz 双声道 PCM 时，加 `--sample-rate 48000 --format wav --channels 2` 输出，便于后续统一混音。
+- 用 `--subtitles` 同时取得真实句级时间戳，例如：
+  `mmx speech synthesize --text "..." --voice <voiceId> --speed 0.98 --subtitles --out production/audio/voice.wav`
+  该命令会额外产出 `production/audio/voice.srt`（毫秒精度），作为第四阶段重建字幕的真实依据。
 - 优先按完整语义段落调用 TTS，避免按字幕行逐条生成造成语调碎裂。
-- 为容易误读的中文、英文缩写、模型名和数字配置发音词典或等效控制。
-- 保留原始请求参数、去敏后的响应、原始音频、服务返回的句级时间戳和生成报告。
+- 为容易误读的中文、英文缩写、模型名和数字，用 `--pronunciation 原文/读音` 控制（可重复），例如 `--pronunciation MiniMax/米尼麦克斯`。
+- 保留原始请求命令（去掉密钥）、CLI 返回的 `extra_info`（时长、采样率、大小）、原始音频和 `voice.srt`，写入生成报告。
 - 不得手工伪造服务返回的时间戳。
 
 ### 断句检查
@@ -106,7 +114,7 @@
 ## 第四阶段：依据实际语音重建 SRT
 
 - 参考 SRT 只用于理解原始内容和大致节奏。没有已录配音时，不把参考时间码当作最终时间码。
-- 以实际语音或 MiniMax 返回的真实时间戳生成 `transcription-production.srt`。
+- 以 `mmx --subtitles` 生成的 `production/audio/voice.srt` 真实时间戳生成 `transcription-production.srt`。该 SRT 已是毫秒精度的句级时间戳，可直接作为基础，再按可读语义单元微调。
 - 字幕按可读语义单元切分，不能直接照搬 TTS 请求分段。
 - 时间使用毫秒精度，不得四舍五入或截断为整数秒。
 - 字幕之间的无文字间隔必须保留，用作呼吸、元素展示、镜头收尾或转场。
