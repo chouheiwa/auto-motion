@@ -159,7 +159,7 @@ BGM 为低密度电子氛围，稳定脉冲，不使用强鼓点，不做赛博�
 | 音频资产 | `production/audio/asset-ledger.json`、授权证据 | 文件名、用途、URL、作者、素材 ID、授权、下载时间、SHA-256、署名要求 |
 | 声音定位 | `production/audio/cue-sheet.json` | 素材、开始帧、持续帧、采样点、增益、淡入淡出和用途 |
 | 声音母版 | `production/audio/voice.wav`、`music.wav`、`sfx.wav`、`premaster.wav` | 48kHz 双声道、精确目标采样数 |
-| 候选与 QC | `production/audio/candidate.mp4`、`machine-qc.json`、`sound-checklist.json` | 规格、帧数、采样数、解码、响度、峰值、边界检查和人工试听状态 |
+| 候选与 QC | `production/audio/candidate.mp4`、`production/audio/machine-qc.json`、`production/audio/sound-checklist.json` | 规格、帧数、采样数、解码、响度、峰值、边界检查和人工试听状态 |
 | 审批 | `production/approval.json` | 输入、候选、检查文件和最终文件哈希；机器审批和发布审批分离 |
 | 最终交付 | 根目录 `final.mp4` | 原子生成后再次记录 SHA-256、规格和完整解码结果 |
 
