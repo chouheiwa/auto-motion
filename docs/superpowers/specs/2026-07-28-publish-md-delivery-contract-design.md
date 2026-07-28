@@ -48,6 +48,7 @@ video:
   fps: null
   video_codec: ""
   pixel_format: ""
+  replacement_in_progress: false
   audio_codec: none
   audio_sample_rate_hz: null
   audio_channels: null
@@ -105,14 +106,17 @@ evidence:
 - `platform` 必须是非空字符串；未知时使用 `unspecified`。
 - `generated_at` 必须是带时区的 ISO 8601 时间。
 - `video.path` 固定为安全的项目相对路径 `final.mp4`。
-- 存在最终视频时，`video.sha256` 必须是 64 位小写十六进制字符串，并与文件实际哈希一致。
-- 视频数值字段必须为正数；没有最终视频时使用 `null`，不得用 `0` 冒充检测结果。
+- 存在最终视频时，`video.sha256` 必须是 64 位小写十六进制字符串。非 `blocked` 状态必须与实际哈希一致；`blocked` 可以保留不一致的旧哈希，但必须包含 `video_hash_mismatch`。
+- 存在且可解码的最终视频必须填写完整视频规格；视频数值字段必须为正数，并与 FFprobe 实测结果一致。
+- 没有最终视频时使用空哈希、空 codec 和 `null` 数值，不得用 `0` 冒充检测结果。
+- 最终视频存在但无法解码时仍记录实际文件哈希，无法可信读取的规格可以为空，并将状态标记为 `blocked`。
+- `video.replacement_in_progress` 必须是布尔值；替换前设为 `true`，新视频和新哈希验证完成后恢复为 `false`。
 - `cover.title_lines` 必须是字符串列表，`line_count` 必须等于列表长度，`frame` 固定为整数 `0`。
 - `cover.source_type` 只允许 `confirmed_config`、`detected_frame_zero`、`generated_candidate`、`unconfirmed`。
 - `confirmed_config` 必须有安全且存在的项目相对 `source_path`；其他类型的 `source_path` 必须为空。
-- `generated_candidate` 或 `unconfirmed` 表示封面尚未确认，`publish_status` 只能是 `draft`。
+- `generated_candidate` 或 `unconfirmed` 形成 `cover_unconfirmed`。没有更高优先级诊断时状态为 `draft`；存在替换、完整性或失败诊断时，严格优先得到 `blocked`。
 - `copy.primary_title` 和 `copy.introduction` 是字符串，`copy.hashtags` 是去重后的字符串列表。
-- `credits.required: true` 时，`credits.text` 和至少一条 `evidence.rights` 必须非空。
+- `credits.required: true` 且缺少 `credits.text` 或 `evidence.rights` 时形成 `credits_evidence_missing`，文档必须标记为 `blocked`；该缺失属于可表达的发布阻塞，不属于 YAML 结构错误。
 - 检查状态只允许 `pending`、`passed`、`failed`、`not_applicable`。
 - 检查为 `not_applicable` 时必须提供非空 `note`。
 - 有音轨时，音频 codec、采样率和声道数必须来自实际检测，耳机和手机外放不得标记 `not_applicable`。
@@ -123,7 +127,7 @@ evidence:
 
 状态按以下优先级计算：
 
-1. `blocked`：视频正在替换、最终视频无法解码、哈希或规格不一致，任一必需检查为 `failed`，或已确认需要署名但缺少授权证据。
+1. `blocked`：`video.replacement_in_progress: true`、最终视频无法解码、哈希或规格不一致，任一必需检查为 `failed`，或已确认需要署名但缺少授权证据。
 2. `draft`：不存在最终视频，平台或主发布信息未确认，封面候选未确认，或必填字段/证据仍缺失。
 3. `pending_manual_checks`：最终视频和发布信息完整、机器验证通过、没有失败项，但至少一项适用的人工检查为 `pending`。
 4. `ready`：最终视频哈希绑定正确，所有必填发布信息和证据完整，所有适用检查均为 `passed`，其余检查具有合理的 `not_applicable` 说明。
@@ -170,6 +174,31 @@ evidence:
 
 验证器必须解析这些章节并与 frontmatter 逐字段比对，不接受仅凭章节存在即通过。
 
+“未完成事项”只允许以下代码，并按此固定顺序生成；带字段名的代码按括号中的固定字段顺序展开：
+
+1. `video_replacement_in_progress`
+2. `final_video_undecodable`
+3. `video_hash_mismatch`
+4. `video_spec_mismatch`
+5. `approval_hash_mismatch`
+6. `manual_check_failed:<name>`（`headphones`、`phone_speaker`、`cover_preview`、`rights_confirmed`）
+7. `credits_evidence_missing`
+8. `final_video_missing`
+9. `platform_unconfirmed`
+10. `primary_title_missing`
+11. `introduction_missing`
+12. `hashtags_missing`
+13. `cover_unconfirmed`
+14. `evidence_missing:<field>`（按工作流要求矩阵中的字段顺序）
+15. `manual_check_pending:<name>`（按上述检查顺序）
+
+文件系统诊断先于状态计算：验证器先探测最终文件、解码、规格、哈希和审批绑定，形成诊断代码，再与 frontmatter 字段和人工检查共同推导状态。
+
+验证分为两层：
+
+- 硬错误：YAML/Markdown 无法解析、类型或枚举错误、不安全路径、凭据泄露、正文与 frontmatter 不一致、状态或“未完成事项”没有真实反映诊断。硬错误返回非零。
+- 合同有效但受阻：解码失败、视频哈希/规格不一致、审批哈希不一致、必需检查失败或署名证据缺失。只要状态为 `blocked` 且诊断代码完整准确，验证返回成功并报告当前受阻状态。
+
 ## 两条流程的取值规则
 
 ### 完整制作流程
@@ -201,6 +230,7 @@ evidence:
 - `publish.md` 不得包含 API 密钥、认证头、Cookie、签名 URL 或其他凭据。
 - 标题、介绍、署名和其他外部文本必须使用安全 YAML 序列化；不得用字符串拼接生成未转义 frontmatter。
 - 多行文本优先使用 YAML block scalar，正文中的 Markdown 控制字符也要安全转义。
+- Markdown 表格单元格使用可逆编码：先把反斜杠编码为 `\\`，再把换行编码为 `\n`，最后把竖线编码为 `\|`。解析时使用单次状态机逆向还原并拒绝其他未知反斜杠转义，不使用有歧义的 `<br>` 替换。
 - 文件必须在同一文件系统内写入临时文件、完成解析和一致性验证后，再原子重命名为 `publish.md`。
 
 ## 模板、验证器与测试
@@ -213,8 +243,10 @@ evidence:
 - 使用安全 YAML 解析。
 - 校验 schema、字段类型、枚举、状态转换、哈希格式、音频条件字段、封面行数、署名条件和安全 evidence 路径。
 - 对实际项目文件校验最终视频哈希和非空证据路径。
+- 最终视频存在时使用 FFprobe 读取流与容器规格，并用 FFmpeg 完整解码；将实际时长、分辨率、帧率、codec、pixel format 和音频规格与 YAML 对比。
+- 文件存在且可解码时，即使状态为 `draft` 也不得省略哈希或规格；文件存在但不可解码时必须形成 `final_video_undecodable` 并标记 `blocked`。
 - 校验 frontmatter 与 Markdown 正文的一致性。
-- 返回非零退出码并给出明确错误，不修改输入文件。
+- 对硬错误返回非零退出码；对合同有效的 `draft`、`pending_manual_checks`、`blocked`、`ready` 返回成功并打印真实状态。验证器不修改输入文件。
 
 新增 `production/tests/test_publish_contract.py`，至少包含：
 
