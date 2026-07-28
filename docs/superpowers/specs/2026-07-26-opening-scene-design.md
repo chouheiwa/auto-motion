@@ -22,7 +22,7 @@ MiniMax TTS 朗读时应将第一句作为问题完整读完，不在“看懂�
 - 位置：现有 `scene-001` 之前
 - 目标时长：以真实 TTS 解码时长为基础，量化到 30fps 整帧后控制在 12–15 秒
 - 输出：1080×1440、30fps、H.264、yuv420p、BT.709、静音镜头 MP4
-- 配音：MiniMax `Chinese (Mandarin)_Sincere_Adult`，固定 `speech-2.8-hd`、speed `0.98`、vol `1`、pitch `0`、emotion `calm`，不做变速或变调
+- 配音：通过 `mmx` CLI 生成。音色用 `mmx speech voices` 选出的「中文（普通话）真诚成年男声」voice ID（`mmx` 不提供 `emotion` 参数，以平静真诚音色表达），固定 `--model speech-2.8-hd`、`--speed 0.98`、`--volume 1`、`--pitch 0`，不做变速或变调
 
 开场是独立的主题引导镜头。Claude 负责该镜头的视觉概念、MG 动效、代码实现和 MP4 渲染；调度脚本只提供开场文案、真实配音节拍、技术规格以及与正文衔接的约束，不预先设计镜头内部动效。
 
