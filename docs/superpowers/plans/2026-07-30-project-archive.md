@@ -57,6 +57,12 @@ class Preflight:
     frozen_git_status: bytes
     inventory: tuple[Entry, ...]
     exclusions: tuple[Exclusion, ...]
+
+@dataclass(frozen=True)
+class ArchiveContext:
+    preflight: Preflight
+    archive_root_identity: FileIdentity
+    staging: Path
 ```
 
 All Git path/status parsing uses `-z` output. All destructive subprocesses use
@@ -180,6 +186,9 @@ exact tested pattern rather than a broad bypass.
 
 All cleanup-specific branch/ref checks occur inside preflight. `--dry-run`
 returns success only after `run_preflight()` completes and asserts no mutation.
+For a default archive root that does not yet exist, preflight records the nearest
+existing ancestor. When the transaction later creates the archive root, it
+immediately captures that directory's own device/inode into `ArchiveContext`.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -269,6 +278,7 @@ Create `ArchiveTransactionTests` covering:
 - existing empty/nonempty target refusal;
 - two concurrent publishers for the same name yielding one winner and one safe
   failure with no replacement.
+- archive root rename/replacement after creation refusing publication.
 
 - [ ] **Step 2: Run RED**
 
@@ -295,9 +305,10 @@ No-replace publication is concrete:
 - unsupported platforms: fail before staging rather than weaken semantics.
 
 Immediately before publication, revalidate source/archive-parent identities and
-source freeze. Scan all copied and generated files, including manifest,
-checksum and verification JSON. Fsync stable files/directories where supported.
-The platform rename primitive is the single atomic commit point.
+the newly captured archive-root identity, then revalidate source freeze. Scan
+all copied and generated files, including manifest, checksum and verification
+JSON. Fsync stable files/directories where supported. The platform rename
+primitive is the single atomic commit point.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -325,7 +336,8 @@ Create `ResetTransactionTests` covering:
 
 - source change after publication blocks cleanup and preserves archive/source;
 - formal archive mutation blocks cleanup;
-- source root or archive-parent inode replacement blocks cleanup;
+- source root, archive parent or created archive-root inode replacement blocks
+  cleanup;
 - old branch or base ref movement after publication blocks cleanup;
 - atomic new ref creation conflict, including a branch in another worktree;
 - checkout-obstructing untracked files without moving the old ref;
@@ -348,8 +360,9 @@ python3 -m unittest auto-test.test_archive_project.ResetTransactionTests -v
 
 - [ ] **Step 3: Implement reset with exact Git primitives**
 
-Before every destructive action, revalidate frozen source/archive identities,
-source inventory/status, full formal archive payload, base commit and old ref.
+Before every destructive action, revalidate frozen source/archive-parent and
+created archive-root identities, source inventory/status, full formal archive
+payload, base commit and old ref.
 
 Create the target ref atomically:
 
@@ -358,10 +371,25 @@ git update-ref refs/heads/<new> <base-commit> 0000000000000000000000000000000000
 ```
 
 Explicitly forbid `switch -C`, `checkout -B`, `reset`, and any force-update of
-the old ref. Use `git clean -ndx -z` (or an equivalent NUL-safe Git command) to
-derive and validate the exact cleanup set, then `git switch --discard-changes`
-to the already-created branch and Git-native cleanup rooted at the verified
-worktree. Revalidate the old ref after each step.
+the old ref. Because `git clean` has no `-z` mode, derive candidates with these
+exact NUL-delimited commands:
+
+```bash
+git status --porcelain=v1 -z --untracked-files=all --ignored=matching
+git ls-files -z --others --exclude-standard
+git ls-files -z --others --ignored --exclude-standard
+```
+
+Cross-check those records against the frozen filesystem inventory and tracked
+path set, then reduce them to validated non-overlapping cleanup roots beneath
+the worktree. Run `git clean -ndx -- <cleanup-roots...>` only as a diagnostic;
+do not parse its quoted human output. After switching with
+`git switch --discard-changes` to the already-created branch, delete with
+`git clean -ffdx -- <the-same-cleanup-roots...>`. Nested repositories require
+the second `-f` and must have appeared as a validated candidate root. Prove
+equivalence by rerunning all three structured commands and comparing the
+remaining filesystem to the frozen base tree; any residue fails verification.
+Revalidate the old ref after each step.
 
 Publish reset-result by writing/fsyncing a same-directory temporary regular
 file, then `os.link(temp, final)` as the atomic no-replace commit and unlink the
@@ -434,14 +462,15 @@ if [[ -f package-lock.json ]]; then npm audit; fi
 if [[ -f requirements.txt ]]; then python3 -m pip_audit -r requirements.txt; fi
 ```
 
-- [ ] **Step 6: Review the complete implementation range**
+- [ ] **Step 6: Review the implementation-only range before the documentation commit**
 
-Use the base captured before implementation, not the working-tree-only diff:
+Use the last plan commit to inspect implementation changes while documentation
+is still uncommitted:
 
 ```bash
-git diff --stat c029185...HEAD
-git diff --name-status c029185...HEAD
-git diff c029185...HEAD -- \
+git diff --stat ac1a341...HEAD
+git diff --name-status ac1a341...HEAD
+git diff ac1a341...HEAD -- \
   archive-project.sh lib/archive_project.py auto-test/test_archive_project.py \
   auto-test/run.sh README.md README.zh-CN.md
 git ls-files --others --exclude-standard
@@ -456,6 +485,22 @@ or project-specific evidence entered `main`.
 git add auto-test/test_archive_project.py auto-test/run.sh README.md README.zh-CN.md
 git commit -m "docs: document project archive workflow"
 ```
+
+- [ ] **Step 8: Review the final main-boundary range after all commits**
+
+```bash
+git diff --stat origin/main...HEAD
+git diff --name-status origin/main...HEAD
+git diff --check origin/main...HEAD
+git diff origin/main...HEAD -- \
+  archive-project.sh lib/archive_project.py auto-test/test_archive_project.py \
+  auto-test/run.sh README.md README.zh-CN.md \
+  docs/superpowers/specs/2026-07-30-project-archive-design.md \
+  docs/superpowers/plans/2026-07-30-project-archive.md
+git ls-files --others --exclude-standard
+```
+
+Re-run `auto-test/validate-main-boundary.sh` after this range review.
 
 ### Task 7: Completion audit against the approved specification
 
@@ -478,6 +523,8 @@ bash -n archive-project.sh
 python3 -m py_compile lib/archive_project.py auto-test/test_archive_project.py
 git diff --check
 git status --short
+git diff --check origin/main...HEAD
+git diff --name-status origin/main...HEAD
 ```
 
 - [ ] **Step 3: Perform a manual temporary-repository smoke test**
