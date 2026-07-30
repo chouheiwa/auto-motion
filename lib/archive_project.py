@@ -125,7 +125,9 @@ EXACT_CREDENTIAL_PLACEHOLDERS = {
 }
 ASSIGNMENT_PATTERN = re.compile(
     br"""(?im)
+    (?<![A-Za-z0-9_])
     ["']?(api[_-]?key|access[_-]?token|token|password|passwd|secret)["']?
+    (?![A-Za-z0-9_])
     \s*[:=]\s*
     (?:
         "([^"\r\n]{8,})"
@@ -370,12 +372,16 @@ def scan_secret_path(path: str, tracked: Set[str]) -> Optional[str]:
     return None
 
 
-def _looks_like_real_assignment(key: bytes, value: bytes) -> bool:
+def _looks_like_real_assignment(
+    key: bytes, value: bytes, quoted: bool
+) -> bool:
     normalized = value.strip()
     if normalized in EXACT_CREDENTIAL_PLACEHOLDERS:
         return False
     lowered = normalized.lower()
-    if lowered.startswith(EXPRESSION_PREFIXES) or b"(" in normalized:
+    if not quoted and (
+        lowered.startswith(EXPRESSION_PREFIXES) or b"(" in normalized
+    ):
         return False
     if key.lower() == b"token":
         return (
@@ -394,10 +400,9 @@ def _scan_secret_bytes(content: bytes) -> Optional[str]:
     if BEARER_PATTERN.search(content):
         return "authorization-bearer"
     for match in ASSIGNMENT_PATTERN.finditer(content):
-        value = next(
-            group for group in match.groups()[1:] if group is not None
-        )
-        if _looks_like_real_assignment(match.group(1), value):
+        quoted = match.group(2) is not None or match.group(3) is not None
+        value = next(group for group in match.groups()[1:] if group is not None)
+        if _looks_like_real_assignment(match.group(1), value, quoted):
             return "credential-assignment"
     return None
 

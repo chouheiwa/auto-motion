@@ -535,7 +535,10 @@ class PreflightTests(unittest.TestCase):
     def test_secret_scanner_handles_structured_and_bearer_credentials(self) -> None:
         examples = (
             b'{"api_key": "real-api-key-value-123456"}',
+            b'{"api_key": "real(key)-value-123456"}',
             b"password: correct horse battery staple",
+            b'password="correct(horse)battery-staple"',
+            b"API_KEY=real-shell-key-value-123456",
             b'Authorization: Bearer header.payload.signature',
         )
         for content in examples:
@@ -555,6 +558,10 @@ class PreflightTests(unittest.TestCase):
             b'api_key = os.environ.get("API_KEY")',
             b"password: Optional[str] = None",
             b"password = request.password",
+            b"password = build_password(defaults)",
+            b"default_password = 'fixture-password-value'",
+            b"not_api_key = 'fixture-api-key-value'",
+            b"mock_secret = 'fixture-secret-value'",
             b'{"api_key": "<your-api-key>"}',
             b"API_KEY=sk-xxxxx",
         )
