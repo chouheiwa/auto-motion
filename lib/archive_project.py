@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import stat
 import subprocess
 import sys
 import unicodedata
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -842,6 +844,360 @@ def run_preflight(
         raise
     except OSError:
         raise PreflightError("filesystem inspection failed")
+
+
+def _recovery_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _decode_git_path(path: bytes) -> str:
+    try:
+        decoded = path.decode("utf-8", "surrogateescape")
+    except UnicodeError:
+        raise PreflightError("Git returned an undecodable recovery path")
+    if _contains_control(decoded):
+        raise PreflightError(
+            "Git returned a recovery path containing a control character"
+        )
+    return decoded
+
+
+def _redact_remote_url(value: str) -> str:
+    if _contains_control(value):
+        return "[REDACTED]"
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return "[REDACTED]"
+    if parsed.scheme and parsed.netloc:
+        hostname = parsed.hostname or ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = "[{}]".format(hostname)
+        port = ""
+        try:
+            if parsed.port is not None:
+                port = ":{}".format(parsed.port)
+        except ValueError:
+            return "[REDACTED]"
+        userinfo = (
+            "[REDACTED]@" if "@" in parsed.netloc else ""
+        )
+        query = ""
+        if parsed.query:
+            names = []
+            for item in parsed.query.split("&"):
+                name = item.split("=", 1)[0]
+                names.append("{}=[REDACTED]".format(name))
+            query = "&".join(names)
+        redacted = urllib.parse.urlunsplit(
+            (
+                parsed.scheme,
+                userinfo + hostname + port,
+                parsed.path,
+                query,
+                "[REDACTED]" if parsed.fragment else "",
+            )
+        )
+    elif re.match(r"^[^/@:\s]+@[^:\s]+:", value):
+        redacted = "[REDACTED]@" + value.split("@", 1)[1]
+    else:
+        redacted = value
+    for _, pattern in SECRET_PATTERNS:
+        redacted = pattern.sub(b"[REDACTED]", redacted.encode("utf-8")).decode(
+            "utf-8"
+        )
+    return redacted
+
+
+def _remote_state(source: Path) -> list:
+    names_result = _run_git(source, ["remote"], check=False)
+    if names_result.returncode != 0:
+        raise PreflightError("local Git remote inspection failed")
+    try:
+        names = names_result.stdout.decode("utf-8").splitlines()
+    except UnicodeError:
+        raise PreflightError("Git returned undecodable remote metadata")
+    remotes = []
+    for name in sorted(names):
+        if _contains_control(name):
+            raise PreflightError("Git returned unsafe remote metadata")
+        urls_result = _run_git(
+            source, ["remote", "get-url", "--all", name], check=False
+        )
+        if urls_result.returncode != 0:
+            raise PreflightError("local Git remote inspection failed")
+        try:
+            urls = urls_result.stdout.decode("utf-8").splitlines()
+        except UnicodeError:
+            raise PreflightError("Git returned undecodable remote metadata")
+        remotes.append(
+            {
+                "name": name,
+                "urls": [_redact_remote_url(url) for url in urls],
+            }
+        )
+    return remotes
+
+
+def _status_state(status: bytes) -> dict:
+    records = [
+        _decode_git_path(record)
+        for record in status.split(b"\0")
+        if record
+    ]
+    return {
+        "format": "porcelain=v1 -z",
+        "records": records,
+        "porcelain_v1_z_sha256": hashlib.sha256(status).hexdigest(),
+    }
+
+
+def _diff_bytes(
+    source: Path,
+    cached: bool,
+    mode: str,
+    excluded_paths: Sequence[bytes] = (),
+) -> bytes:
+    arguments = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+    ]
+    if cached:
+        arguments.append("--cached")
+    if mode == "patch":
+        arguments.extend(["--full-index", "--"])
+        arguments.extend(
+            ":(literal,exclude){}".format(_decode_git_path(path))
+            for path in sorted(excluded_paths)
+        )
+    elif mode == "name-status":
+        arguments.extend(["--name-status", "-z", "--diff-filter=MD", "--"])
+    elif mode == "numstat":
+        arguments.extend(["--numstat", "-z", "--diff-filter=MD", "--"])
+    else:
+        raise ValueError("unsupported Git diff mode")
+    return _run_git(source, arguments).stdout
+
+
+def _binary_paths(source: Path, cached: bool) -> Set[bytes]:
+    binary_paths = set()
+    for record in _diff_bytes(source, cached, "numstat").split(b"\0"):
+        if not record:
+            continue
+        fields = record.split(b"\t", 2)
+        if len(fields) != 3:
+            raise PreflightError("Git returned malformed binary metadata")
+        if fields[0] == b"-" and fields[1] == b"-":
+            binary_paths.add(fields[2])
+    return binary_paths
+
+
+def _binary_changes(
+    source: Path, cached: bool, binary_paths: Set[bytes]
+) -> list:
+    tokens = [
+        token
+        for token in _diff_bytes(
+            source, cached, "name-status"
+        ).split(b"\0")
+        if token
+    ]
+    if len(tokens) % 2:
+        raise PreflightError("Git returned malformed change metadata")
+    changes = []
+    for index in range(0, len(tokens), 2):
+        status = tokens[index].decode("ascii", "strict")
+        path = tokens[index + 1]
+        if path not in binary_paths:
+            continue
+        changes.append(
+            {
+                "layer": "index" if cached else "worktree",
+                "change": "deleted" if status == "D" else "modified",
+                "path": _decode_git_path(path),
+            }
+        )
+    return changes
+
+
+def _untracked_paths(source: Path) -> list:
+    output = _run_git(
+        source,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    ).stdout
+    return sorted(_decode_git_path(path) for path in output.split(b"\0") if path)
+
+
+def _binary_report(
+    changes: list, original_commit: Optional[str]
+) -> bytes:
+    lines = [
+        "# Binary changes",
+        "",
+        (
+            "Binary payloads are intentionally omitted from the patches. "
+            "Existing modified files are preserved by the archive snapshot."
+        ),
+    ]
+    if original_commit:
+        lines.append(
+            (
+                "The original committed content can be recovered from "
+                "commit {}."
+            ).format(original_commit)
+        )
+    else:
+        lines.append(
+            "No original commit exists for this unborn repository."
+        )
+    lines.append("")
+    if changes:
+        for change in sorted(
+            changes,
+            key=lambda item: (
+                item["path"],
+                item["layer"],
+                item["change"],
+            ),
+        ):
+            lines.append(
+                "{} ({}): {}".format(
+                    change["change"],
+                    change["layer"],
+                    json.dumps(change["path"], ensure_ascii=False),
+                )
+            )
+    else:
+        lines.append("(none)")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _restore_guide() -> bytes:
+    return b"""# Restore this archive safely
+
+Work in a new, disposable Git worktree or clone. Read `git-state.json` first and
+verify the recorded source commit and base commit before making changes.
+
+1. Restore the archived snapshot into the chosen worktree without overwriting
+   unrelated files.
+2. Review `untracked-files.txt`; each line is a JSON-quoted path.
+3. Inspect `binary-changes.txt`. Binary payloads are not embedded in patches.
+4. Check the staged layer with:
+   `git apply --check recovery/index-changes.patch`
+5. If the check succeeds, apply it with:
+   `git apply --index recovery/index-changes.patch`
+6. Check and apply the unstaged layer afterward:
+   `git apply --check recovery/worktree-changes.patch`
+   `git apply recovery/worktree-changes.patch`
+
+Empty patch files require no action. Review `git status` and the resulting diff
+before committing. Destructive reset or cleanup commands are unnecessary.
+"""
+
+
+def _scan_and_write_recovery(
+    recovery: Path, name: str, content: bytes
+) -> None:
+    relative = "recovery/{}".format(name)
+    detected = scan_secret_stream(relative, io.BytesIO(content))
+    if detected is not None:
+        raise PreflightError(
+            "{}: credential pattern ({})".format(relative, detected)
+        )
+    try:
+        (recovery / name).write_bytes(content)
+    except OSError:
+        raise PreflightError(
+            "{}: unable to write recovery evidence".format(relative)
+        )
+
+
+def write_recovery_files(preflight: Preflight, staging: Path) -> None:
+    staging = Path(staging)
+    recovery = staging / "recovery"
+    try:
+        if not staging.is_dir() or os.path.lexists(str(recovery)):
+            raise PreflightError("recovery staging directory is not empty")
+        recovery.mkdir()
+        index_binary_paths = _binary_paths(preflight.source, True)
+        worktree_binary_paths = _binary_paths(preflight.source, False)
+        index_patch = _diff_bytes(
+            preflight.source,
+            True,
+            "patch",
+            tuple(index_binary_paths),
+        )
+        worktree_patch = _diff_bytes(
+            preflight.source,
+            False,
+            "patch",
+            tuple(worktree_binary_paths),
+        )
+        binary_changes = (
+            _binary_changes(
+                preflight.source, True, index_binary_paths
+            )
+            + _binary_changes(
+                preflight.source, False, worktree_binary_paths
+            )
+        )
+        untracked = _untracked_paths(preflight.source)
+        state = {
+            "format_version": 1,
+            "generated_at": _recovery_timestamp(),
+            "source": {
+                "path": str(preflight.source),
+                "branch": preflight.old_branch,
+                "commit": preflight.old_commit,
+                "ref_commit": preflight.old_ref_commit,
+            },
+            "base": {
+                "ref": preflight.base_ref,
+                "commit": preflight.base_commit or None,
+            },
+            "status": _status_state(preflight.frozen_git_status),
+            "remotes": _remote_state(preflight.source),
+        }
+        documents = (
+            ("index-changes.patch", index_patch),
+            ("worktree-changes.patch", worktree_patch),
+            (
+                "binary-changes.txt",
+                _binary_report(binary_changes, preflight.old_commit),
+            ),
+            (
+                "untracked-files.txt",
+                (
+                    "".join(
+                        json.dumps(path, ensure_ascii=False) + "\n"
+                        for path in untracked
+                    )
+                ).encode("utf-8"),
+            ),
+            (
+                "git-state.json",
+                (
+                    json.dumps(
+                        state,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            ),
+            ("RESTORE.md", _restore_guide()),
+        )
+        for name, content in documents:
+            _scan_and_write_recovery(recovery, name, content)
+    except PreflightError:
+        shutil.rmtree(str(staging), ignore_errors=True)
+        raise
+    except (OSError, UnicodeError, ValueError):
+        shutil.rmtree(str(staging), ignore_errors=True)
+        raise PreflightError("recovery evidence generation failed")
 
 
 def _print_plan(preflight: Preflight) -> None:

@@ -841,5 +841,221 @@ class PreflightTests(unittest.TestCase):
         )
 
 
+class RecoveryEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.test_root = Path(self.temporary_directory.name)
+        self.repo = self.test_root / "recovery source"
+        self.repo.mkdir()
+        self.git("init", "-b", "project/recovery")
+        self.git("config", "user.name", "Archive Test")
+        self.git("config", "user.email", "archive@example.invalid")
+        self.write("notes.txt", "base text\n")
+        self.write("remove.txt", "remove this text\n")
+        self.write("modified.bin", b"\x00base-binary\xff")
+        self.write("deleted.bin", b"\x00deleted-binary\xfe")
+        self.git("add", ".")
+        self.git("commit", "-m", "initial")
+        self.git("branch", "main")
+        self.archive_root = self.test_root / "archives"
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def git(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def write(self, relative: str, content: object) -> Path:
+        path = self.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(str(content), encoding="utf-8")
+        return path
+
+    def args(self) -> argparse.Namespace:
+        return archive_project.parse_args(
+            [
+                "--archive-only",
+                "--archive-root",
+                str(self.archive_root),
+                "--archive-name",
+                "snapshot",
+            ]
+        )
+
+    def generate(self) -> Tuple[Path, "archive_project.Preflight"]:
+        preflight = archive_project.run_preflight(self.args(), self.repo)
+        staging = self.test_root / "recovery staging"
+        staging.mkdir()
+        archive_project.write_recovery_files(preflight, staging)
+        return staging / "recovery", preflight
+
+    def test_staged_only_text_changes_have_an_index_patch(self) -> None:
+        self.write("notes.txt", "staged text\n")
+        self.git("add", "notes.txt")
+
+        recovery, _ = self.generate()
+
+        self.assertIn(
+            "+staged text",
+            (recovery / "index-changes.patch").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            (recovery / "worktree-changes.patch").read_text(encoding="utf-8"),
+            "",
+        )
+
+    def test_unstaged_only_text_changes_have_a_worktree_patch(self) -> None:
+        self.write("notes.txt", "unstaged text\n")
+
+        recovery, _ = self.generate()
+
+        self.assertEqual(
+            (recovery / "index-changes.patch").read_text(encoding="utf-8"),
+            "",
+        )
+        self.assertIn(
+            "+unstaged text",
+            (recovery / "worktree-changes.patch").read_text(encoding="utf-8"),
+        )
+
+    def test_mixed_text_changes_preserve_both_layers(self) -> None:
+        self.write("notes.txt", "staged layer\n")
+        self.git("add", "notes.txt")
+        self.write("notes.txt", "staged layer\nworktree layer\n")
+
+        recovery, _ = self.generate()
+
+        self.assertIn(
+            "+staged layer",
+            (recovery / "index-changes.patch").read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "+worktree layer",
+            (recovery / "worktree-changes.patch").read_text(encoding="utf-8"),
+        )
+
+    def test_deleted_text_is_preserved_without_binary_patch_payloads(self) -> None:
+        (self.repo / "remove.txt").unlink()
+
+        recovery, _ = self.generate()
+        patch = (recovery / "worktree-changes.patch").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("-remove this text", patch)
+        for path in recovery.iterdir():
+            if path.is_file():
+                self.assertNotIn(b"GIT binary patch", path.read_bytes())
+
+    def test_modified_and_deleted_binary_paths_have_recovery_notes(self) -> None:
+        self.write("modified.bin", b"\x00changed-binary\xfd")
+        (self.repo / "deleted.bin").unlink()
+
+        recovery, preflight = self.generate()
+        report = (recovery / "binary-changes.txt").read_text(encoding="utf-8")
+
+        self.assertIn("modified.bin", report)
+        self.assertIn("modified", report)
+        self.assertIn("deleted.bin", report)
+        self.assertIn("deleted", report)
+        self.assertIn(preflight.old_commit, report)
+        self.assertIn("original committed content", report)
+        patch = (recovery / "worktree-changes.patch").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("GIT binary patch", patch)
+        self.assertNotIn("modified.bin", patch)
+        self.assertNotIn("deleted.bin", patch)
+
+    def test_untracked_spaces_and_unicode_are_unambiguous(self) -> None:
+        self.write("loose file.txt", "safe\n")
+        self.write("镜头/新 文件.txt", "safe\n")
+
+        recovery, _ = self.generate()
+        lines = (
+            recovery / "untracked-files.txt"
+        ).read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(
+            [json.loads(line) for line in lines],
+            ["loose file.txt", "镜头/新 文件.txt"],
+        )
+
+    def test_detached_head_state_is_explicit_and_remotes_are_redacted(self) -> None:
+        self.git(
+            "remote",
+            "add",
+            "origin",
+            "https://user:top-secret@example.invalid/repo.git"
+            "?token=query-secret&mode=read",
+        )
+        self.git("switch", "--detach", "HEAD")
+
+        recovery, preflight = self.generate()
+        state_text = (recovery / "git-state.json").read_text(encoding="utf-8")
+        state = json.loads(state_text)
+
+        self.assertIsNone(state["source"]["branch"])
+        self.assertEqual(state["source"]["commit"], preflight.old_commit)
+        self.assertEqual(state["base"]["ref"], preflight.base_ref)
+        self.assertEqual(state["base"]["commit"], preflight.base_commit)
+        self.assertEqual(state["source"]["path"], str(self.repo.resolve()))
+        self.assertTrue(state["status"]["porcelain_v1_z_sha256"])
+        self.assertEqual(state["format_version"], 1)
+        self.assertTrue(state["generated_at"])
+        self.assertNotIn("top-secret", state_text)
+        self.assertNotIn("query-secret", state_text)
+        self.assertIn("[REDACTED]", state_text)
+
+    def test_unborn_head_state_is_explicit_and_restore_guide_is_safe(self) -> None:
+        shutil.rmtree(self.repo / ".git")
+        self.git("init", "-b", "project/unborn")
+        self.git("config", "user.name", "Archive Test")
+        self.git("config", "user.email", "archive@example.invalid")
+
+        recovery, preflight = self.generate()
+        state = json.loads(
+            (recovery / "git-state.json").read_text(encoding="utf-8")
+        )
+        restore = (recovery / "RESTORE.md").read_text(encoding="utf-8")
+
+        self.assertEqual(state["source"]["branch"], "project/unborn")
+        self.assertIsNone(state["source"]["commit"])
+        self.assertIsNone(preflight.old_commit)
+        self.assertIn("index-changes.patch", restore)
+        self.assertIn("worktree-changes.patch", restore)
+        self.assertIn("untracked-files.txt", restore)
+        self.assertIn("binary-changes.txt", restore)
+        self.assertNotIn("git reset --hard", restore)
+        self.assertNotIn("git clean", restore)
+
+    def test_generated_historic_credential_fails_closed_without_disclosure(
+        self,
+    ) -> None:
+        credential = "deleted-value-" + ("A1b2" * 8)
+        self.write("historic.txt", "password={}\n".format(credential))
+        self.git("add", "historic.txt")
+        self.git("commit", "-m", "historic credential fixture")
+        (self.repo / "historic.txt").unlink()
+        preflight = archive_project.run_preflight(self.args(), self.repo)
+        staging = self.test_root / "credential staging"
+        staging.mkdir()
+
+        with self.assertRaises(archive_project.PreflightError) as caught:
+            archive_project.write_recovery_files(preflight, staging)
+
+        self.assertFalse(staging.exists())
+        self.assertNotIn(credential, str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
