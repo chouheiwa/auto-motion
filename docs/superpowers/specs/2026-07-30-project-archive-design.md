@@ -2,7 +2,9 @@
 
 ## Status
 
-Approved in conversation on 2026-07-30.
+Concept approved in conversation on 2026-07-30. Revised after independent
+specification review; implementation remains pending final specification
+approval.
 
 ## Purpose
 
@@ -83,7 +85,14 @@ _archive/<old-project-id>-<timestamp>/
 │   └── RESTORE.md
 ├── archive-manifest.json
 ├── SHA256SUMS
-└── verification.json
+└── archive-verification.json
+```
+
+Cleanup results are written after the archive transaction to an adjacent file,
+not into the immutable archive:
+
+```text
+_archive/<old-project-id>-<timestamp>.reset-result.json
 ```
 
 ### `snapshot/`
@@ -107,6 +116,11 @@ It excludes:
 Every exclusion rule and every excluded path is recorded in
 `archive-manifest.json`. Files must never be skipped silently.
 
+Included symbolic links are copied as links and are never dereferenced. A link
+is accepted only when its resolved target is an existing path inside the source
+worktree. Absolute, dangling and worktree-external links are hard failures.
+Included sockets, devices, FIFOs and other special files are also hard failures.
+
 ### Recovery evidence
 
 `git-state.txt` records, without credentials:
@@ -121,6 +135,10 @@ Every exclusion rule and every excluded path is recorded in
 `tracked-changes.patch` is generated as a binary-safe Git diff of tracked
 working-tree and index changes. `untracked-files.txt` lists untracked paths.
 The complete file content remains available under `snapshot/`.
+
+Cleanup requires a named, existing, non-protected branch. Detached HEAD and an
+unborn branch are supported by archive-only mode but are hard blockers for
+cleanup.
 
 `RESTORE.md` provides commands for:
 
@@ -142,20 +160,29 @@ metadata. It contains:
 - resolved base ref and base commit;
 - archive mode and command options, excluding secrets;
 - sorted inclusion and exclusion records;
-- for every included regular file: relative path, byte size and SHA-256;
+- for every protected payload entry: relative path, file type, portable mode,
+  byte size and SHA-256, or link target for a symbolic link;
 - total included files and bytes;
 - hashes of key deliverables when present;
 - warnings and non-fatal observations.
 
-`SHA256SUMS` contains the same included-file hashes in a standard sorted format.
-Paths containing unsupported control characters cause a safe failure.
+The protected payload includes all entries beneath `snapshot/` and `recovery/`.
+`SHA256SUMS` contains hashes for all protected regular files and domain-separated
+hashes of accepted symbolic-link targets in a standard sorted format. Paths
+containing unsupported control characters cause a safe failure.
 
-After copying, the tool recomputes every destination hash. `verification.json`
-records expected and actual file counts, byte totals, hash results and overall
-status. Cleanup is allowed only when the verification status is `passed`.
+After copying, the tool recomputes every destination hash and validates file
+types, modes and link targets. `archive-verification.json` records expected and
+actual file counts, byte totals, metadata and hash results, plus overall status.
+It is written before the staging directory is atomically committed and is not
+part of the protected payload.
 
-The archive itself receives a summary digest calculated from the final
-`SHA256SUMS` and manifest. The script prints this digest on success.
+The immutable archive identity is a domain-separated SHA-256 calculated from the
+exact bytes of `archive-manifest.json` and `SHA256SUMS`. Those two files bind the
+complete protected payload without requiring a self-referential hash.
+`archive-verification.json` records this identity, and the script prints it on
+success. The adjacent reset-result file records the archive identity it refers
+to but is explicitly outside the immutable archive boundary.
 
 ## Secret handling
 
@@ -168,10 +195,11 @@ Secret detection has two layers:
 2. likely embedded credential patterns are scanned locally with redacted
    reporting that prints paths and rule identifiers only.
 
-In archive-only mode, excluded sensitive files are reported but do not prevent
-archiving. In cleanup mode, the presence of any excluded sensitive file is a
-hard blocker because cleanup would destroy a file that was not preserved.
-Users must relocate or remove those files themselves and rerun the command.
+Any known secret-bearing path or credential-pattern match is a hard failure in
+both archive-only and cleanup modes. A match reports only the relative path and
+rule identifier; it never prints the matching content. There is no general
+command-line bypass. Users must relocate or remove sensitive files themselves
+and rerun the command.
 
 Remote URLs are redacted before recording. URLs containing userinfo, access
 tokens or credential-like query parameters must never be emitted verbatim.
@@ -188,8 +216,11 @@ Before creating files, the script:
 4. validates that the new branch does not exist;
 5. validates and canonicalizes the archive destination;
 6. inventories included, excluded and sensitive paths;
-7. checks required commands and available destination space;
-8. prints the resolved old project, archive destination, base commit and new
+7. rejects unsupported links, special files and unsafe path names;
+8. captures a frozen source inventory containing every non-disposable entry's
+   type, mode, size, link target or hash, plus exact Git status;
+9. checks required commands and available destination space;
+10. prints the resolved old project, archive destination, base commit and new
    branch.
 
 `--dry-run` exits successfully after this phase and performs no writes.
@@ -200,11 +231,23 @@ The script creates a uniquely named staging directory beneath the archive root
 on the same filesystem as the final archive. It copies the snapshot, writes
 recovery evidence, generates manifests and verifies every copied file.
 
+Verification compares the staged destination to the frozen source inventory,
+not merely to a post-copy view of the source. This detects files that changed
+while being copied.
+
 If any operation fails, the script removes only the uniquely identified staging
 directory and leaves the source worktree unchanged.
 
 After verification passes, the staging directory is atomically renamed to the
 final archive directory. An existing target is never replaced.
+
+Immediately before cleanup, the tool rescans the source and compares it to the
+frozen source inventory. The comparison covers the complete non-disposable file
+set, file types, modes, sizes, link targets, hashes and exact Git status. Any
+addition, deletion or change preserves the completed archive but refuses
+cleanup. Changes beneath explicitly disposable cache directories may be
+reported without blocking because those directories are neither archived nor
+recoverable project evidence.
 
 ### Phase 3: workspace reset
 
@@ -218,22 +261,37 @@ This phase runs only when all of the following are true:
 
 The tool then:
 
-1. creates and switches to the new project branch at the frozen base commit,
-   discarding archived tracked worktree changes;
-2. removes untracked and ignored project files from the explicitly resolved
-   worktree root while preserving `.git` metadata;
-3. verifies that `HEAD` equals the frozen base commit;
-4. verifies the expected new branch name;
-5. verifies that `git status --porcelain` is empty;
-6. verifies that reusable template files required by the repository remain;
-7. verifies that project-only paths such as `production/`, `scenes/`,
+1. records the original branch ref and its target commit again;
+2. creates the new branch ref at the frozen base commit without moving or
+   rewriting the original branch ref;
+3. previews the exact Git-native untracked/ignored cleanup set and verifies that
+   every reported path is beneath the resolved worktree root;
+4. force-switches the worktree to the already-created new branch, discarding
+   only the archived tracked worktree state and files that obstruct checkout;
+5. verifies immediately that the new branch and `HEAD` equal the frozen base
+   commit and that the original branch ref still points to its original commit;
+6. removes the previewed untracked and ignored project files with Git-native
+   cleanup rooted at the verified worktree;
+7. verifies again that the original branch ref was not moved;
+8. verifies that no untracked or ignored entry remains using complete Git status
+   and an equivalent Git-native cleanup dry run;
+9. verifies that reusable template files required by the repository remain;
+10. verifies that project-only paths such as `production/`, `scenes/`,
    `final.mp4`, and project subtitles are absent unless tracked by the base
-   commit.
+   commit;
+11. writes the adjacent reset-result file with the archive identity, old and new
+   refs, cleanup result and final workspace status.
 
-The reset implementation may use Git-native cleanup commands only after the
-source root, branch, archive and confirmation guard have all been validated. It
-must not accept `/`, a home directory, the repository parent, an unresolved
-environment variable, or a glob as a cleanup target.
+The reset has no persistent local-file whitelist: a reusable configuration that
+must survive belongs in the tracked `main` template, while secrets must live
+outside the project directory.
+
+The reset implementation may use Git-native forced switch and cleanup commands
+only after the source root, named old branch, unchanged old ref, archive
+identity, source freeze and confirmation guard have all been validated. It must
+never reset or force-update the original branch ref. It must not accept `/`, a
+home directory, the repository parent, an unresolved environment variable, or
+a glob as a cleanup target.
 
 ## Failure and recovery behavior
 
@@ -243,8 +301,9 @@ environment variable, or a glob as a cleanup target.
 - **Archive committed, reset not started:** keep the verified archive and leave
   the source unchanged.
 - **Reset failure after mutation starts:** keep the verified archive, return a
-  non-zero status, print the archive and recovery-document paths, and do not
-  claim that the workspace is ready.
+  non-zero status, write a failed adjacent reset-result when possible, print the
+  archive and recovery-document paths, and do not claim that the workspace is
+  ready.
 
 The script should perform automatic rollback only when it can prove the
 destination and source states. It must prefer a verified archive plus explicit
@@ -255,15 +314,35 @@ recovery instructions over an uncertain automatic overwrite.
 Success output includes:
 
 - absolute archive path;
-- archive manifest path and summary digest;
+- archive manifest path and immutable archive identity;
 - old branch and commit;
 - new branch and frozen base commit, when cleanup ran;
 - excluded disposable paths;
 - archive verification status;
 - final workspace cleanliness status.
 
-Machine-readable status is also written to `verification.json`. Human output
-must be concise and must not expose sensitive values.
+Machine-readable archive status is written to `archive-verification.json`.
+Machine-readable cleanup status is written to the adjacent reset-result file.
+Human output must be concise and must not expose sensitive values.
+
+## Implementation architecture and portability
+
+`archive-project.sh` is a small Bash entry point that resolves its own location
+and executes a Python 3 standard-library implementation under `lib/`. Python
+performs argument parsing, canonical path validation, inventory, copy, metadata
+handling, hashing, JSON serialization, secret scanning and subprocess
+coordination. This avoids incompatible macOS/Linux variants of `sha256sum`,
+`stat`, `readlink` and `cp`.
+
+Git remains the authority for branch operations, status and cleanup. Structured
+Git output uses NUL delimiters where available so spaces, Unicode and newlines
+cannot be misparsed. Unsupported control characters are rejected before an
+archive is created.
+
+The tool records the source and archive-root device/inode identities during
+preflight and revalidates them immediately before atomic rename and every
+destructive Git action. A symlink swap, directory replacement or source-root
+identity change is a hard failure.
 
 ## Main-branch boundary
 
@@ -292,12 +371,24 @@ Tests should cover at least:
 - exclusions recorded without silent omission;
 - refusal to clean when excluded sensitive files exist;
 - redaction of credential-bearing remote URLs;
+- hard failure for embedded credential matches without leaking matched values;
+- preservation of internal symbolic links without dereferencing;
+- refusal of external, absolute and dangling links and included special files;
+- source changes during copying being detected by destination verification;
+- source changes after archive commit refusing cleanup;
 - simulated copy and verification failures leaving the source unchanged;
 - refusal on protected branches;
+- refusal from detached HEAD and unborn branches in cleanup mode;
 - refusal when the new branch already exists;
+- checkout obstruction by untracked files without moving the old branch ref;
 - successful reset to the frozen base commit in a temporary repository;
+- original branch ref remaining unchanged through a successful reset;
+- final absence of tracked changes, untracked files and ignored files;
 - final clean worktree and absence of project-only fixture paths;
 - no overwrite of an existing archive;
+- traversal rejection in `--archive-name` and safe resolution of nonexistent
+  destination paths;
+- macOS-compatible operation using Python standard-library file primitives;
 - boundary-validator success.
 
 Destructive-path tests must run only inside temporary directories created by
