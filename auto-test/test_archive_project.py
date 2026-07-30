@@ -1011,6 +1011,8 @@ class RecoveryEvidenceTests(unittest.TestCase):
         self.assertEqual(state["source"]["path"], str(self.repo.resolve()))
         self.assertTrue(state["status"]["porcelain_v1_z_sha256"])
         self.assertEqual(state["format_version"], 1)
+        self.assertEqual(archive_project.SCRIPT_VERSION, "1.0.0")
+        self.assertEqual(state["script_version"], "1.0.0")
         self.assertTrue(state["generated_at"])
         self.assertNotIn("top-secret", state_text)
         self.assertNotIn("query-secret", state_text)

@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import BinaryIO, FrozenSet, Optional, Sequence, Set, Tuple
 
 
+SCRIPT_VERSION = "1.0.0"
+
+
 class PreflightError(RuntimeError):
     """A safe, redacted preflight failure."""
 
@@ -1168,6 +1171,7 @@ def write_recovery_files(preflight: Preflight, staging: Path) -> None:
         untracked = _untracked_paths(preflight.source)
         state = {
             "format_version": 1,
+            "script_version": SCRIPT_VERSION,
             "generated_at": _recovery_timestamp(),
             "source": {
                 "path": str(preflight.source),
