@@ -440,6 +440,18 @@ class PreflightTests(unittest.TestCase):
         ):
             self.preflight()
 
+    def test_archive_root_parent_must_resolve_through_a_directory(self) -> None:
+        regular_ancestor = self.test_root / "not-a-directory"
+        regular_ancestor.write_text("file ancestor", encoding="utf-8")
+        args = self.args()
+        args.archive_root = str(regular_ancestor / "child")
+
+        with self.assertRaisesRegex(
+            archive_project.PreflightError,
+            "nearest existing archive.*directory",
+        ):
+            self.preflight(args)
+
     def test_tracked_env_example_is_included_and_scanned(self) -> None:
         env = self.write(".env.example", "OPENAI_API_KEY=sk-xxxxx\n")
         self.git("add", ".env.example")

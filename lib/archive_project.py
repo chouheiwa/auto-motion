@@ -557,6 +557,10 @@ def capture_identity(path_or_nearest_parent: Path) -> FileIdentity:
         if parent == candidate:
             raise PreflightError("no existing archive parent is available")
         candidate = parent
+    if not candidate.is_dir():
+        raise PreflightError(
+            "nearest existing archive parent must be a directory"
+        )
     metadata = candidate.stat()
     return FileIdentity(
         str(candidate), metadata.st_dev, metadata.st_ino
