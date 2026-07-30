@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
 import argparse
+import concurrent.futures
+import hashlib
 import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Tuple
@@ -71,16 +75,6 @@ class ArchiveProjectParserTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result)
         self.assertIn(expected_message, result.stderr)
 
-    def assert_not_implemented(self, arguments: Tuple[str, ...]) -> None:
-        result = self.run_command(*arguments)
-
-        self.assertEqual(result.returncode, 1, result)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(
-            result.stderr,
-            "archive-project: execution is not implemented yet\n",
-        )
-
     def test_help_describes_the_command_contract(self) -> None:
         result = self.run_command("--help")
 
@@ -109,8 +103,19 @@ class ArchiveProjectParserTests(unittest.TestCase):
             "unrecognized arguments: --confirm-clea",
         )
 
-    def test_archive_only_reaches_the_intentional_stub(self) -> None:
-        self.assert_not_implemented(("--archive-only",))
+    def test_archive_only_executes_the_archive_transaction(self) -> None:
+        archive_root = self.repo.parent / "parser archive"
+        result = self.run_command(
+            "--archive-only",
+            "--archive-root",
+            str(archive_root),
+            "--archive-name",
+            "snapshot",
+        )
+
+        self.assertEqual(result.returncode, 0, result)
+        self.assertTrue((archive_root / "snapshot").is_dir())
+        self.assertIn("archive verification: passed", result.stdout)
 
     def test_confirmed_cleanup_on_protected_branch_is_rejected(self) -> None:
         result = self.run_command(
@@ -839,6 +844,392 @@ class PreflightTests(unittest.TestCase):
             self.git("for-each-ref", "--format=%(refname)").stdout,
             before_refs,
         )
+
+
+class ArchiveTransactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.test_root = Path(self.temporary_directory.name)
+        self.repo = self.test_root / "project source"
+        self.repo.mkdir()
+        self.git("init", "-b", "project/current")
+        self.git("config", "user.name", "Archive Test")
+        self.git("config", "user.email", "archive@example.invalid")
+        self.write("tracked.txt", "committed\n")
+        self.write("changed.txt", "before\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "initial")
+        self.git("branch", "main")
+        self.write("changed.txt", "modified\n")
+        self.write("loose/untracked.txt", "untracked\n")
+        self.write("final.mp4", b"\x00final-video\xff")
+        self.write("cache/node_modules/ignored.txt", "ignored\n")
+        self.link = self.repo / "current-link"
+        self.link.symlink_to("changed.txt")
+        self.archive_root = self.test_root / "custom archives"
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def git(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def write(self, relative: str, content: object) -> Path:
+        path = self.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(str(content), encoding="utf-8")
+        return path
+
+    def arguments(
+        self, name: str = "snapshot", archive_root: Path = None
+    ) -> list:
+        return [
+            "--archive-only",
+            "--archive-root",
+            str(archive_root or self.archive_root),
+            "--archive-name",
+            name,
+        ]
+
+    def run_command(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(ARCHIVE_COMMAND), *arguments],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def create(self, name: str = "snapshot") -> Path:
+        result = self.run_command(*self.arguments(name))
+        self.assertEqual(result.returncode, 0, result)
+        return self.archive_root / name
+
+    def test_archive_only_uses_overridden_and_default_sibling_paths(self) -> None:
+        final = self.create("chosen-name")
+        self.assertTrue(final.is_dir())
+
+        default_name = "default-name"
+        result = self.run_command(
+            "--archive-only", "--archive-name", default_name
+        )
+        self.assertEqual(result.returncode, 0, result)
+        self.assertTrue((self.test_root / "_archive" / default_name).is_dir())
+
+    def test_snapshot_preserves_exact_content_and_internal_symlink(self) -> None:
+        final = self.create()
+        snapshot = final / "snapshot"
+
+        self.assertEqual(
+            (snapshot / "tracked.txt").read_bytes(),
+            (self.repo / "tracked.txt").read_bytes(),
+        )
+        self.assertEqual(
+            (snapshot / "changed.txt").read_bytes(), b"modified\n"
+        )
+        self.assertEqual(
+            (snapshot / "loose/untracked.txt").read_bytes(), b"untracked\n"
+        )
+        self.assertTrue((snapshot / "current-link").is_symlink())
+        self.assertEqual(os.readlink(snapshot / "current-link"), "changed.txt")
+        self.assertFalse((snapshot / ".git").exists())
+        self.assertFalse((snapshot / "cache/node_modules").exists())
+
+    def test_manifest_records_entries_exclusions_and_portable_metadata(self) -> None:
+        final = self.create()
+        manifest_bytes = (final / "archive-manifest.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+        entries = {entry["path"]: entry for entry in manifest["entries"]}
+
+        self.assertEqual(
+            manifest_bytes,
+            archive_project.canonical_json(manifest),
+        )
+        self.assertIn(
+            {"path": ".git", "rule": "git-metadata"},
+            manifest["exclusions"],
+        )
+        self.assertIn(
+            {
+                "path": "cache/node_modules",
+                "rule": "dependencies",
+            },
+            manifest["exclusions"],
+        )
+        self.assertEqual(entries["snapshot/current-link"]["type"], "symlink")
+        self.assertEqual(
+            entries["snapshot/current-link"]["target"], "changed.txt"
+        )
+        self.assertEqual(entries["snapshot/changed.txt"]["type"], "file")
+        self.assertEqual(entries["snapshot/changed.txt"]["size"], 9)
+        self.assertEqual(
+            entries["snapshot/changed.txt"]["sha256"],
+            hashlib.sha256(b"modified\n").hexdigest(),
+        )
+        self.assertEqual(
+            entries["snapshot/changed.txt"]["mode"],
+            stat.S_IMODE((self.repo / "changed.txt").stat().st_mode),
+        )
+        self.assertEqual(entries["snapshot/loose"]["type"], "directory")
+        self.assertEqual(
+            manifest["key_deliverables"]["snapshot/final.mp4"],
+            hashlib.sha256(b"\x00final-video\xff").hexdigest(),
+        )
+
+    def test_sums_are_sorted_regular_files_only_and_identity_is_bound(self) -> None:
+        final = self.create()
+        manifest_bytes = (final / "archive-manifest.json").read_bytes()
+        sums_bytes = (final / "SHA256SUMS").read_bytes()
+        lines = sums_bytes.decode("utf-8").splitlines()
+        verification = json.loads(
+            (final / "archive-verification.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(lines, sorted(lines, key=lambda line: line[66:]))
+        self.assertTrue(all("  " in line for line in lines))
+        self.assertFalse(any("current-link" in line for line in lines))
+        self.assertEqual(
+            verification["archive_identity"],
+            archive_project.archive_identity(manifest_bytes, sums_bytes),
+        )
+        self.assertEqual(
+            archive_project.archive_identity(manifest_bytes, sums_bytes),
+            hashlib.sha256(
+                b"auto-motion-archive-v1\0"
+                + len(manifest_bytes).to_bytes(8, "big")
+                + manifest_bytes
+                + len(sums_bytes).to_bytes(8, "big")
+                + sums_bytes
+            ).hexdigest(),
+        )
+
+    def test_sums_use_standard_backslash_filename_escaping(self) -> None:
+        content = b"portable checksum path\n"
+        self.write(r"back\slash.txt", content)
+        final = self.create()
+        sums = (final / "SHA256SUMS").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "\\{}  snapshot/back\\\\slash.txt\n".format(
+                hashlib.sha256(content).hexdigest()
+            ),
+            sums,
+        )
+
+    def test_verification_is_outside_payload_and_has_exact_totals(self) -> None:
+        final = self.create()
+        manifest = json.loads(
+            (final / "archive-manifest.json").read_text(encoding="utf-8")
+        )
+        verification = json.loads(
+            (final / "archive-verification.json").read_text(encoding="utf-8")
+        )
+        protected_paths = {entry["path"] for entry in manifest["entries"]}
+
+        self.assertNotIn("archive-verification.json", protected_paths)
+        self.assertNotIn("archive-manifest.json", protected_paths)
+        self.assertNotIn("SHA256SUMS", protected_paths)
+        self.assertEqual(verification["status"], "passed")
+        self.assertEqual(
+            verification["expected"]["entries"],
+            verification["actual"]["entries"],
+        )
+        self.assertEqual(
+            verification["expected"]["files"],
+            verification["actual"]["files"],
+        )
+        self.assertEqual(
+            verification["expected"]["bytes"],
+            verification["actual"]["bytes"],
+        )
+
+    def test_generated_metadata_and_output_are_scanned_before_publication(
+        self,
+    ) -> None:
+        credential = "sk-" + ("Z" * 32)
+        args = archive_project.parse_args(self.arguments())
+        preflight = archive_project.run_preflight(args, self.repo)
+        with mock.patch.object(
+            archive_project,
+            "_recovery_timestamp",
+            return_value=credential,
+        ):
+            with self.assertRaisesRegex(
+                archive_project.PreflightError, "credential pattern"
+            ) as caught:
+                archive_project.create_archive(preflight)
+
+        self.assertFalse((self.archive_root / "snapshot").exists())
+        self.assertNotIn(credential, str(caught.exception))
+        if self.archive_root.exists():
+            self.assertEqual(list(self.archive_root.iterdir()), [])
+
+    def test_mid_copy_mutation_fails_and_removes_only_its_staging(self) -> None:
+        args = archive_project.parse_args(self.arguments())
+        preflight = archive_project.run_preflight(args, self.repo)
+        original = archive_project._copy_regular_file
+        mutation_done = False
+
+        def mutate_after_copy(source, destination, entry):
+            nonlocal mutation_done
+            original(source, destination, entry)
+            if entry.path == "changed.txt" and not mutation_done:
+                mutation_done = True
+                (self.repo / "changed.txt").write_text(
+                    "mutated during copy\n", encoding="utf-8"
+                )
+
+        self.archive_root.mkdir()
+        unrelated = self.archive_root / ".unrelated-staging"
+        unrelated.mkdir()
+        with mock.patch.object(
+            archive_project,
+            "_copy_regular_file",
+            side_effect=mutate_after_copy,
+        ):
+            with self.assertRaisesRegex(
+                archive_project.PreflightError, "changed|mismatch"
+            ):
+                archive_project.create_archive(preflight)
+
+        self.assertTrue(unrelated.is_dir())
+        self.assertFalse((self.archive_root / "snapshot").exists())
+        self.assertEqual(
+            (self.repo / "changed.txt").read_text(encoding="utf-8"),
+            "mutated during copy\n",
+        )
+        self.assertEqual(
+            [path.name for path in self.archive_root.iterdir()],
+            [".unrelated-staging"],
+        )
+
+    def test_existing_empty_nonempty_and_dangling_targets_are_never_replaced(
+        self,
+    ) -> None:
+        self.archive_root.mkdir()
+        for kind in ("empty", "nonempty", "dangling"):
+            final = self.archive_root / kind
+            if kind == "dangling":
+                final.symlink_to("missing")
+            else:
+                final.mkdir()
+                if kind == "nonempty":
+                    (final / "keep.txt").write_text("keep\n", encoding="utf-8")
+            result = self.run_command(*self.arguments(kind))
+            self.assertEqual(result.returncode, 1, result)
+            if kind == "dangling":
+                self.assertTrue(final.is_symlink())
+            else:
+                self.assertTrue(final.is_dir())
+                if kind == "nonempty":
+                    self.assertEqual(
+                        (final / "keep.txt").read_text(encoding="utf-8"),
+                        "keep\n",
+                    )
+
+    def test_two_concurrent_publishers_have_one_winner_without_replacement(
+        self,
+    ) -> None:
+        self.archive_root.mkdir()
+        staging_one = self.archive_root / ".staging-one"
+        staging_two = self.archive_root / ".staging-two"
+        staging_one.mkdir()
+        staging_two.mkdir()
+        (staging_one / "winner").write_text("one", encoding="utf-8")
+        (staging_two / "winner").write_text("two", encoding="utf-8")
+        final = self.archive_root / "same-name"
+        barrier = threading.Barrier(2)
+
+        def publish(staging: Path) -> object:
+            barrier.wait()
+            try:
+                archive_project.publish_directory_no_replace(staging, final)
+                return "won"
+            except archive_project.PreflightError:
+                return "lost"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(publish, (staging_one, staging_two)))
+
+        self.assertEqual(sorted(results), ["lost", "won"])
+        self.assertIn(
+            (final / "winner").read_text(encoding="utf-8"), {"one", "two"}
+        )
+        self.assertEqual(
+            sum(path.exists() for path in (staging_one, staging_two)), 1
+        )
+
+    def test_archive_root_swap_and_source_change_block_publication(self) -> None:
+        args = archive_project.parse_args(self.arguments())
+        preflight = archive_project.run_preflight(args, self.repo)
+        original_publish = archive_project.publish_directory_no_replace
+
+        def swap_root(staging, final):
+            moved = self.test_root / "moved archive root"
+            self.archive_root.rename(moved)
+            self.archive_root.mkdir()
+            original_publish(staging, final)
+
+        with mock.patch.object(
+            archive_project,
+            "publish_directory_no_replace",
+            side_effect=swap_root,
+        ):
+            with self.assertRaisesRegex(
+                archive_project.PreflightError, "identity"
+            ):
+                archive_project.create_archive(preflight)
+        self.assertFalse((self.archive_root / "snapshot").exists())
+
+    def test_cleanup_mode_archives_then_stops_before_reset(self) -> None:
+        before = self.git("status", "--porcelain=v1", "-z").stdout
+        result = self.run_command(
+            "--next-project",
+            "next",
+            "--confirm-clean",
+            "--archive-root",
+            str(self.archive_root),
+            "--archive-name",
+            "cleanup-snapshot",
+        )
+
+        self.assertEqual(result.returncode, 1, result)
+        self.assertTrue((self.archive_root / "cleanup-snapshot").is_dir())
+        self.assertIn("reset is not implemented", result.stderr)
+        self.assertEqual(
+            self.git("status", "--porcelain=v1", "-z").stdout, before
+        )
+        self.assertEqual(
+            self.git("branch", "--show-current").stdout.strip(),
+            "project/current",
+        )
+
+    def test_success_output_is_sanitized_and_formally_reverified(self) -> None:
+        result = self.run_command(*self.arguments())
+        self.assertEqual(result.returncode, 0, result)
+        final = (self.archive_root / "snapshot").resolve()
+        output = result.stdout
+        manifest = json.loads(
+            (final / "archive-manifest.json").read_text(encoding="utf-8")
+        )
+
+        self.assertIn(str(final), output)
+        self.assertIn("archive identity:", output)
+        self.assertIn("old branch: project/current", output)
+        self.assertIn("old commit:", output)
+        self.assertIn("excluded:", output)
+        self.assertIn("archive verification: passed", output)
+        verification = archive_project.verify_payload(final, manifest)
+        self.assertEqual(verification.status, "passed")
 
 
 class RecoveryEvidenceTests(unittest.TestCase):

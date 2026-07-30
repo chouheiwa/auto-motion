@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -10,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass
@@ -93,6 +96,24 @@ class Preflight:
     frozen_git_status: bytes
     inventory: Tuple[Entry, ...]
     exclusions: Tuple[Exclusion, ...]
+
+
+@dataclass(frozen=True)
+class ArchiveContext:
+    preflight: Preflight
+    archive_root_identity: FileIdentity
+    staging: Path
+
+
+@dataclass(frozen=True)
+class Verification:
+    status: str
+    expected_entries: int
+    actual_entries: int
+    expected_files: int
+    actual_files: int
+    expected_bytes: int
+    actual_bytes: int
 
 
 EXCLUDED_DIRECTORY_RULES = {
@@ -772,6 +793,7 @@ def _run_preflight(
 ) -> Preflight:
     if shutil.which("git") is None:
         raise PreflightError("required command is unavailable: git")
+    ensure_no_replace_supported()
     repo = discover_repository(Path(cwd))
     timestamp = current_timestamp()
     new_branch = _validate_cleanup_state(repo, args, timestamp)
@@ -1241,6 +1263,627 @@ def write_recovery_files(preflight: Preflight, staging: Path) -> None:
         raise PreflightError("recovery evidence generation failed")
 
 
+def canonical_json(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise PreflightError("unable to encode canonical archive metadata")
+
+
+def _identity_at(path: Path) -> FileIdentity:
+    try:
+        metadata = Path(path).stat()
+    except OSError:
+        raise PreflightError("filesystem identity changed")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PreflightError("filesystem identity changed")
+    return FileIdentity(str(Path(path)), metadata.st_dev, metadata.st_ino)
+
+
+def _require_identity(expected: FileIdentity) -> None:
+    actual = _identity_at(Path(expected.path))
+    if (
+        actual.device != expected.device
+        or actual.inode != expected.inode
+    ):
+        raise PreflightError("filesystem identity changed")
+
+
+def _no_replace_function():
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        raise PreflightError(
+            "atomic no-replace publication is unsupported"
+        )
+    if sys.platform == "darwin":
+        try:
+            function = libc.renamex_np
+        except AttributeError:
+            raise PreflightError(
+                "atomic no-replace publication is unsupported"
+            )
+        function.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        return function, 4
+    if sys.platform.startswith("linux"):
+        try:
+            function = libc.renameat2
+        except AttributeError:
+            raise PreflightError(
+                "atomic no-replace publication is unsupported"
+            )
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        return function, 1
+    raise PreflightError("atomic no-replace publication is unsupported")
+
+
+def ensure_no_replace_supported() -> None:
+    _no_replace_function()
+
+
+def _entry_matches(path: Path, entry: Entry) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode != entry.mode:
+        return False
+    if entry.kind == "directory":
+        return stat.S_ISDIR(metadata.st_mode)
+    if entry.kind == "symlink":
+        if not stat.S_ISLNK(metadata.st_mode):
+            return False
+        try:
+            return os.readlink(str(path)) == entry.link_target
+        except OSError:
+            return False
+    if entry.kind != "file" or not stat.S_ISREG(metadata.st_mode):
+        return False
+    try:
+        mode, size, digest, detected = _read_inventory_file(
+            path, entry.path
+        )
+    except PreflightError:
+        return False
+    return (
+        mode == entry.mode
+        and size == entry.size
+        and digest == entry.sha256
+        and detected is None
+    )
+
+
+def _copy_regular_file(
+    source: Path, destination: Path, entry: Entry
+) -> None:
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with source.open("rb") as input_stream:
+            before = os.fstat(input_stream.fileno())
+            with destination.open("xb") as output_stream:
+                while True:
+                    chunk = input_stream.read(64 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    total += len(chunk)
+                    output_stream.write(chunk)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+            after = os.fstat(input_stream.fileno())
+        os.chmod(str(destination), entry.mode)
+    except OSError:
+        raise PreflightError(
+            "{}: unable to copy included file".format(entry.path)
+        )
+    source_state = (
+        stat.S_IMODE(before.st_mode),
+        before.st_size,
+        before.st_dev,
+        before.st_ino,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    final_source_state = (
+        stat.S_IMODE(after.st_mode),
+        after.st_size,
+        after.st_dev,
+        after.st_ino,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if (
+        source_state != final_source_state
+        or source_state[0] != entry.mode
+        or total != entry.size
+        or digest.hexdigest() != entry.sha256
+    ):
+        raise PreflightError(
+            "{}: source changed or staged payload mismatch".format(
+                entry.path
+            )
+        )
+
+
+def copy_snapshot(preflight: Preflight, staging: Path) -> None:
+    snapshot = Path(staging) / "snapshot"
+    try:
+        snapshot.mkdir()
+        for entry in preflight.inventory:
+            source = preflight.source / entry.path
+            destination = snapshot / entry.path
+            if entry.kind == "directory":
+                destination.mkdir()
+                os.chmod(str(destination), entry.mode)
+            elif entry.kind == "file":
+                _copy_regular_file(source, destination, entry)
+            elif entry.kind == "symlink":
+                if not _entry_matches(source, entry):
+                    raise PreflightError(
+                        "{}: source changed before copy".format(entry.path)
+                    )
+                destination.symlink_to(entry.link_target)
+            else:
+                raise PreflightError("unsupported frozen inventory entry")
+    except PreflightError:
+        raise
+    except OSError:
+        raise PreflightError("snapshot copy failed")
+
+
+def _payload_inventory(root: Path) -> Tuple[Entry, ...]:
+    entries = []
+
+    def visit(directory: Path) -> None:
+        try:
+            children = sorted(
+                os.scandir(str(directory)), key=lambda child: child.name
+            )
+        except OSError:
+            raise PreflightError("unable to inspect staged payload")
+        for child in children:
+            path = Path(child.path)
+            relative = path.relative_to(root).as_posix()
+            if _contains_control(relative):
+                raise PreflightError(
+                    "generated payload path contains a control character"
+                )
+            try:
+                metadata = child.stat(follow_symlinks=False)
+            except OSError:
+                raise PreflightError("unable to inspect staged payload")
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISDIR(metadata.st_mode):
+                entries.append(
+                    Entry(relative, "directory", mode, 0, None, None)
+                )
+                visit(path)
+            elif stat.S_ISREG(metadata.st_mode):
+                read_mode, size, digest, detected = _read_inventory_file(
+                    path, relative
+                )
+                if detected is not None:
+                    raise PreflightError(
+                        "{}: credential pattern ({})".format(
+                            relative, detected
+                        )
+                    )
+                entries.append(
+                    Entry(
+                        relative,
+                        "file",
+                        read_mode,
+                        size,
+                        digest,
+                        None,
+                    )
+                )
+            elif stat.S_ISLNK(metadata.st_mode):
+                try:
+                    target = os.readlink(str(path))
+                except OSError:
+                    raise PreflightError("unable to inspect staged symlink")
+                entries.append(
+                    Entry(relative, "symlink", mode, 0, None, target)
+                )
+            else:
+                raise PreflightError(
+                    "staged payload contains an unsupported special file"
+                )
+
+    for protected in ("snapshot", "recovery"):
+        protected_path = root / protected
+        if not protected_path.is_dir():
+            raise PreflightError("protected payload is incomplete")
+        metadata = protected_path.lstat()
+        entries.append(
+            Entry(
+                protected,
+                "directory",
+                stat.S_IMODE(metadata.st_mode),
+                0,
+                None,
+                None,
+            )
+        )
+        visit(protected_path)
+    return tuple(sorted(entries, key=lambda entry: entry.path))
+
+
+def _entry_document(entry: Entry) -> dict:
+    document = {
+        "mode": entry.mode,
+        "path": entry.path,
+        "size": entry.size,
+        "type": entry.kind,
+    }
+    if entry.sha256 is not None:
+        document["sha256"] = entry.sha256
+    if entry.link_target is not None:
+        document["target"] = entry.link_target
+    return document
+
+
+def build_payload_manifest(
+    staging: Path, preflight: Preflight
+) -> bytes:
+    entries = _payload_inventory(Path(staging))
+    files = [entry for entry in entries if entry.kind == "file"]
+    key_deliverables = {}
+    for entry in files:
+        relative = entry.path
+        name = Path(relative).name.lower()
+        if (
+            relative == "snapshot/final.mp4"
+            or name == "publish.md"
+            or name.endswith((".srt", ".vtt", ".ass"))
+        ):
+            key_deliverables[relative] = entry.sha256
+    manifest = {
+        "archive_mode": (
+            "cleanup" if preflight.new_branch is not None else "archive-only"
+        ),
+        "base": {
+            "commit": preflight.base_commit or None,
+            "ref": preflight.base_ref,
+        },
+        "created_at": _recovery_timestamp(),
+        "entries": [_entry_document(entry) for entry in entries],
+        "exclusions": [
+            {"path": item.path, "rule": item.rule}
+            for item in preflight.exclusions
+        ],
+        "format_version": 1,
+        "key_deliverables": key_deliverables,
+        "options": {
+            "archive_root": str(preflight.archive_root),
+            "final_archive": str(preflight.final_archive),
+        },
+        "project_id": preflight.project_id,
+        "script_version": SCRIPT_VERSION,
+        "source": {
+            "branch": preflight.old_branch,
+            "commit": preflight.old_commit,
+            "path": str(preflight.source),
+        },
+        "totals": {
+            "bytes": sum(entry.size for entry in files),
+            "entries": len(entries),
+            "files": len(files),
+        },
+        "warnings": [],
+    }
+    return canonical_json(manifest)
+
+
+def _sha256_sums(manifest: dict) -> bytes:
+    lines = []
+    for entry in sorted(
+        manifest["entries"], key=lambda item: item["path"]
+    ):
+        if entry["type"] == "file":
+            path = entry["path"]
+            escaped = "\\" in path
+            if escaped:
+                path = path.replace("\\", "\\\\")
+            lines.append(
+                "{}{}  {}\n".format(
+                    "\\" if escaped else "",
+                    entry["sha256"],
+                    path,
+                )
+            )
+    return "".join(lines).encode("utf-8")
+
+
+def verify_payload(root: Path, manifest: dict) -> Verification:
+    expected_entries = manifest.get("entries")
+    if not isinstance(expected_entries, list):
+        raise PreflightError("archive manifest has invalid entries")
+    actual = [_entry_document(entry) for entry in _payload_inventory(Path(root))]
+    expected = sorted(expected_entries, key=lambda entry: entry["path"])
+    actual = sorted(actual, key=lambda entry: entry["path"])
+    expected_files = sum(
+        entry["type"] == "file" for entry in expected
+    )
+    actual_files = sum(entry["type"] == "file" for entry in actual)
+    expected_bytes = sum(
+        entry["size"] for entry in expected if entry["type"] == "file"
+    )
+    actual_bytes = sum(
+        entry["size"] for entry in actual if entry["type"] == "file"
+    )
+    if expected != actual:
+        raise PreflightError("formal archive payload verification failed")
+    return Verification(
+        "passed",
+        len(expected),
+        len(actual),
+        expected_files,
+        actual_files,
+        expected_bytes,
+        actual_bytes,
+    )
+
+
+def archive_identity(manifest: bytes, sums: bytes) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"auto-motion-archive-v1\0")
+    digest.update(len(manifest).to_bytes(8, "big"))
+    digest.update(manifest)
+    digest.update(len(sums).to_bytes(8, "big"))
+    digest.update(sums)
+    return digest.hexdigest()
+
+
+def _scan_generated(relative: str, content: bytes) -> None:
+    detected = scan_secret_stream(relative, io.BytesIO(content))
+    if detected is not None:
+        raise PreflightError(
+            "{}: credential pattern ({})".format(relative, detected)
+        )
+
+
+def _write_stable(path: Path, content: bytes) -> None:
+    _scan_generated(path.name, content)
+    try:
+        with path.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        raise PreflightError("unable to write archive metadata")
+
+
+def _revalidate_source(preflight: Preflight) -> None:
+    _require_identity(preflight.source_identity)
+    state = discover_repository(preflight.source)
+    inventory = build_inventory(
+        preflight.source,
+        GitPaths(state.tracked, _historical_paths(state)),
+    )
+    if (
+        inventory.entries != preflight.inventory
+        or inventory.exclusions != preflight.exclusions
+        or state.status != preflight.frozen_git_status
+        or state.branch != preflight.old_branch
+        or state.commit != preflight.old_commit
+    ):
+        raise PreflightError("source changed since the frozen preflight")
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(str(path), flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        if error.errno not in (
+            errno.EINVAL,
+            errno.ENOTSUP,
+            getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        ):
+            raise PreflightError("unable to stabilize archive directory")
+
+
+def publish_directory_no_replace(staging: Path, final: Path) -> None:
+    staging = Path(staging)
+    final = Path(final)
+    if not staging.is_dir():
+        raise PreflightError("archive root identity changed")
+    try:
+        staging_parent = staging.parent.stat()
+        final_parent = final.parent.stat()
+    except OSError:
+        raise PreflightError("archive root identity changed")
+    if (
+        staging_parent.st_dev != final_parent.st_dev
+        or staging_parent.st_ino != final_parent.st_ino
+    ):
+        raise PreflightError("archive root identity changed")
+    function, flag = _no_replace_function()
+    source_bytes = os.fsencode(str(staging))
+    final_bytes = os.fsencode(str(final))
+    ctypes.set_errno(0)
+    if sys.platform == "darwin":
+        result = function(source_bytes, final_bytes, flag)
+    else:
+        result = function(
+            -100, source_bytes, -100, final_bytes, flag
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+            raise PreflightError(
+                "final archive already exists: {}".format(final)
+            )
+        raise PreflightError("atomic archive publication failed")
+
+
+def _verification_document(
+    verification: Verification, identity: str
+) -> bytes:
+    return canonical_json(
+        {
+            "actual": {
+                "bytes": verification.actual_bytes,
+                "entries": verification.actual_entries,
+                "files": verification.actual_files,
+            },
+            "archive_identity": identity,
+            "expected": {
+                "bytes": verification.expected_bytes,
+                "entries": verification.expected_entries,
+                "files": verification.expected_files,
+            },
+            "status": verification.status,
+        }
+    )
+
+
+def create_archive(preflight: Preflight) -> Tuple[Path, str]:
+    ensure_no_replace_supported()
+    _require_identity(preflight.source_identity)
+    _require_identity(preflight.archive_parent_identity)
+    try:
+        preflight.archive_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise PreflightError("unable to create archive root")
+    archive_root_identity = _identity_at(preflight.archive_root)
+    context = ArchiveContext(
+        preflight,
+        archive_root_identity,
+        Path(
+            tempfile.mkdtemp(
+                prefix=".archive-staging-",
+                dir=str(preflight.archive_root),
+            )
+        ),
+    )
+    published = False
+    try:
+        copy_snapshot(preflight, context.staging)
+        write_recovery_files(preflight, context.staging)
+        manifest_bytes = build_payload_manifest(
+            context.staging, preflight
+        )
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        sums_bytes = _sha256_sums(manifest)
+        _write_stable(
+            context.staging / "archive-manifest.json", manifest_bytes
+        )
+        _write_stable(context.staging / "SHA256SUMS", sums_bytes)
+        verification = verify_payload(context.staging, manifest)
+        identity = archive_identity(manifest_bytes, sums_bytes)
+        verification_bytes = _verification_document(
+            verification, identity
+        )
+        _write_stable(
+            context.staging / "archive-verification.json",
+            verification_bytes,
+        )
+        _fsync_directory(context.staging / "snapshot")
+        _fsync_directory(context.staging / "recovery")
+        _fsync_directory(context.staging)
+        _require_identity(preflight.archive_parent_identity)
+        _require_identity(context.archive_root_identity)
+        _revalidate_source(preflight)
+        _require_identity(preflight.source_identity)
+        _require_identity(preflight.archive_parent_identity)
+        _require_identity(context.archive_root_identity)
+        if os.path.lexists(str(preflight.final_archive)):
+            raise PreflightError(
+                "final archive already exists: {}".format(
+                    preflight.final_archive
+                )
+            )
+        publish_directory_no_replace(
+            context.staging, preflight.final_archive
+        )
+        published = True
+        final_identity = _identity_at(preflight.final_archive)
+        _fsync_directory(preflight.archive_root)
+        final_manifest_bytes = (
+            preflight.final_archive / "archive-manifest.json"
+        ).read_bytes()
+        final_sums_bytes = (
+            preflight.final_archive / "SHA256SUMS"
+        ).read_bytes()
+        if (
+            final_manifest_bytes != manifest_bytes
+            or final_sums_bytes != sums_bytes
+            or archive_identity(
+                final_manifest_bytes, final_sums_bytes
+            )
+            != identity
+        ):
+            raise PreflightError("published archive identity mismatch")
+        verify_payload(preflight.final_archive, manifest)
+        _require_identity(final_identity)
+        _require_identity(context.archive_root_identity)
+        return preflight.final_archive, identity
+    except PreflightError:
+        if not published:
+            shutil.rmtree(str(context.staging), ignore_errors=True)
+        raise
+    except (OSError, ValueError, UnicodeError):
+        if not published:
+            shutil.rmtree(str(context.staging), ignore_errors=True)
+        raise PreflightError("archive transaction failed")
+
+
+def _success_output(preflight: Preflight, identity: str) -> bytes:
+    excluded = (
+        ", ".join(item.path for item in preflight.exclusions)
+        or "(none)"
+    )
+    content = (
+        "archive: {}\n"
+        "archive manifest: {}\n"
+        "archive identity: {}\n"
+        "old branch: {}\n"
+        "old commit: {}\n"
+        "excluded: {}\n"
+        "archive verification: passed\n"
+    ).format(
+        preflight.final_archive.resolve(),
+        (preflight.final_archive / "archive-manifest.json").resolve(),
+        identity,
+        preflight.old_branch or "(detached)",
+        preflight.old_commit or "(unborn)",
+        excluded,
+    ).encode("utf-8")
+    _scan_generated("stdout", content)
+    return content
+
+
 def _print_plan(preflight: Preflight) -> None:
     print("source: {}".format(preflight.source))
     print("project: {}".format(preflight.project_id))
@@ -1260,8 +1903,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.dry_run:
         _print_plan(preflight)
         return 0
-    sys.stderr.write("archive-project: execution is not implemented yet\n")
-    return 1
+    try:
+        _, identity = create_archive(preflight)
+        output = _success_output(preflight, identity)
+    except PreflightError as error:
+        sys.stderr.write("archive-project: {}\n".format(error))
+        return 1
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.flush()
+    if not args.archive_only:
+        sys.stderr.write(
+            "archive-project: reset is not implemented; source unchanged\n"
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
