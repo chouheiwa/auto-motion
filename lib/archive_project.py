@@ -116,20 +116,47 @@ SECRET_PATTERNS = (
         "github-token",
         re.compile(br"(?:ghp|github_pat)_[A-Za-z0-9_]{20,}"),
     ),
-    (
-        "credential-assignment",
-        re.compile(
-            br"(?i)(?:api[_-]?key|access[_-]?token|token|"
-            br"password|passwd|secret)"
-            br"\s*[:=]\s*[\"']?"
-            br"([A-Za-z0-9_./+<>{}@:$-]{12,})(?=$|[\s\"'])"
-        ),
-    ),
 )
 EXACT_CREDENTIAL_PLACEHOLDERS = {
     b"<your-api-key>",
-    b"<your-api-key>\\n",
+    b"sk-xxxxx",
+    b"your-api-key-here",
+    b"your_api_key_here",
 }
+ASSIGNMENT_PATTERN = re.compile(
+    br"""(?im)
+    ["']?(api[_-]?key|access[_-]?token|token|password|passwd|secret)["']?
+    \s*[:=]\s*
+    (?:
+        "([^"\r\n]{8,})"
+        |
+        '([^'\r\n]{8,})'
+        |
+        ([^\s#,\]}][^\r\n#,\]}]{7,})
+    )
+    """,
+    re.VERBOSE,
+)
+BEARER_PATTERN = re.compile(
+    br"""(?ix)
+    ["']?authorization["']?\s*[:=]\s*["']?
+    bearer\s+([A-Za-z0-9._~+/-]{12,})
+    """
+)
+EXPRESSION_PREFIXES = (
+    b"os.",
+    b"process.",
+    b"parser.",
+    b"config.",
+    b"settings.",
+    b"self.",
+    b"args.",
+    b"request.",
+    b"env.",
+    b"get_",
+    b"optional[",
+    b"${",
+)
 
 
 def sanitize_project_id(value: str) -> str:
@@ -343,24 +370,48 @@ def scan_secret_path(path: str, tracked: Set[str]) -> Optional[str]:
     return None
 
 
+def _looks_like_real_assignment(key: bytes, value: bytes) -> bool:
+    normalized = value.strip()
+    if normalized in EXACT_CREDENTIAL_PLACEHOLDERS:
+        return False
+    lowered = normalized.lower()
+    if lowered.startswith(EXPRESSION_PREFIXES) or b"(" in normalized:
+        return False
+    if key.lower() == b"token":
+        return (
+            len(normalized) >= 24
+            and any(65 <= byte <= 90 for byte in normalized)
+            and any(97 <= byte <= 122 for byte in normalized)
+            and any(48 <= byte <= 57 for byte in normalized)
+        )
+    return len(normalized) >= 8
+
+
+def _scan_secret_bytes(content: bytes) -> Optional[str]:
+    for rule, pattern in SECRET_PATTERNS:
+        if pattern.search(content):
+            return rule
+    if BEARER_PATTERN.search(content):
+        return "authorization-bearer"
+    for match in ASSIGNMENT_PATTERN.finditer(content):
+        value = next(
+            group for group in match.groups()[1:] if group is not None
+        )
+        if _looks_like_real_assignment(match.group(1), value):
+            return "credential-assignment"
+    return None
+
+
 def scan_secret_stream(path: str, stream: BinaryIO) -> Optional[str]:
     overlap = b""
+    detected = None
     while True:
         chunk = stream.read(64 * 1024)
         if not chunk:
-            return None
+            return detected
         sample = overlap + chunk
-        for rule, pattern in SECRET_PATTERNS:
-            matches = tuple(pattern.finditer(sample))
-            if not matches:
-                continue
-            if rule == "credential-assignment" and all(
-                match.group(1) in EXACT_CREDENTIAL_PLACEHOLDERS
-                for match in matches
-            ):
-                continue
-            return rule
-        overlap = sample[-512:]
+        detected = detected or _scan_secret_bytes(sample)
+        overlap = sample[-4096:]
 
 
 def _contains_control(path: str) -> bool:
@@ -377,9 +428,14 @@ def _is_within(child: Path, parent: Path) -> bool:
 def validate_link_chain(
     root: Path, path: Path, included: Set[str]
 ) -> str:
-    root_resolved = root.resolve()
     relative_path = path.relative_to(root).as_posix()
-    initial_target = os.readlink(str(path))
+    try:
+        root_resolved = root.resolve()
+        initial_target = os.readlink(str(path))
+    except OSError:
+        raise PreflightError(
+            "unable to inspect symlink '{}'".format(relative_path)
+        )
     current = root_resolved
     pending = list(path.relative_to(root).parts)
     visited = set()
@@ -425,7 +481,12 @@ def validate_link_chain(
                 "symlink '{}' is cyclic".format(relative_path)
             )
         visited.add(candidate)
-        target = os.readlink(str(candidate))
+        try:
+            target = os.readlink(str(candidate))
+        except OSError:
+            raise PreflightError(
+                "unable to inspect symlink '{}'".format(relative_path)
+            )
         if os.path.isabs(target):
             raise PreflightError(
                 "symlink '{}' has an absolute target".format(relative_path)
@@ -436,14 +497,59 @@ def validate_link_chain(
     return initial_target
 
 
-def _hash_file(path: Path) -> str:
+def _after_file_read(path: Path) -> None:
+    pass
+
+
+def _read_inventory_file(
+    path: Path, relative: str
+) -> Tuple[int, int, str, Optional[str]]:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while True:
-            chunk = stream.read(64 * 1024)
-            if not chunk:
-                return digest.hexdigest()
-            digest.update(chunk)
+    total = 0
+    overlap = b""
+    detected = None
+    try:
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                digest.update(chunk)
+                sample = overlap + chunk
+                detected = detected or _scan_secret_bytes(sample)
+                overlap = sample[-4096:]
+            _after_file_read(path)
+            after = os.fstat(stream.fileno())
+    except OSError:
+        raise PreflightError(
+            "{}: unable to read included file".format(relative)
+        )
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_before != identity_after or total != before.st_size:
+        raise PreflightError(
+            "{}: file changed while being read".format(relative)
+        )
+    return (
+        stat.S_IMODE(before.st_mode),
+        total,
+        digest.hexdigest(),
+        detected,
+    )
 
 
 def build_inventory(root: Path, git_paths: GitPaths) -> Inventory:
@@ -480,9 +586,14 @@ def build_inventory(root: Path, git_paths: GitPaths) -> Inventory:
                 raise PreflightError(
                     "path contains a control character: {!r}".format(relative)
                 )
+            try:
+                metadata = child.stat(follow_symlinks=False)
+            except OSError:
+                raise PreflightError(
+                    "{}: unable to inspect source entry".format(relative)
+                )
             if child.name in EXCLUDED_DIRECTORY_RULES and (
-                child.is_dir(follow_symlinks=False)
-                or child.name == ".git"
+                stat.S_ISDIR(metadata.st_mode) or child.name == ".git"
             ):
                 exclusions.append(
                     Exclusion(
@@ -490,7 +601,10 @@ def build_inventory(root: Path, git_paths: GitPaths) -> Inventory:
                     )
                 )
                 continue
-            if child.name in EXCLUDED_FILE_RULES:
+            if (
+                child.name in EXCLUDED_FILE_RULES
+                and stat.S_ISREG(metadata.st_mode)
+            ):
                 exclusions.append(
                     Exclusion(relative, EXCLUDED_FILE_RULES[child.name])
                 )
@@ -500,7 +614,6 @@ def build_inventory(root: Path, git_paths: GitPaths) -> Inventory:
                 raise PreflightError(
                     "{}: sensitive path ({})".format(relative, secret_rule)
                 )
-            metadata = child.stat(follow_symlinks=False)
             mode = stat.S_IMODE(metadata.st_mode)
             if stat.S_ISDIR(metadata.st_mode):
                 included.add(relative)
@@ -509,8 +622,9 @@ def build_inventory(root: Path, git_paths: GitPaths) -> Inventory:
                 )
                 visit(path)
             elif stat.S_ISREG(metadata.st_mode):
-                with path.open("rb") as stream:
-                    content_rule = scan_secret_stream(relative, stream)
+                mode, size, sha256, content_rule = _read_inventory_file(
+                    path, relative
+                )
                 if content_rule is not None:
                     raise PreflightError(
                         "{}: credential pattern ({})".format(
@@ -523,8 +637,8 @@ def build_inventory(root: Path, git_paths: GitPaths) -> Inventory:
                         relative,
                         "file",
                         mode,
-                        metadata.st_size,
-                        _hash_file(path),
+                        size,
+                        sha256,
                         None,
                     )
                 )
@@ -637,7 +751,7 @@ def _validate_cleanup_state(
     return new_branch
 
 
-def run_preflight(
+def _run_preflight(
     args: argparse.Namespace, cwd: Path
 ) -> Preflight:
     if shutil.which("git") is None:
@@ -706,6 +820,17 @@ def run_preflight(
         inventory=inventory.entries,
         exclusions=inventory.exclusions,
     )
+
+
+def run_preflight(
+    args: argparse.Namespace, cwd: Path
+) -> Preflight:
+    try:
+        return _run_preflight(args, cwd)
+    except PreflightError:
+        raise
+    except OSError:
+        raise PreflightError("filesystem inspection failed")
 
 
 def _print_plan(preflight: Preflight) -> None:

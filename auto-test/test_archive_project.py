@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -21,10 +22,42 @@ import archive_project
 
 
 class ArchiveProjectParserTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temporary_directory.name) / "hermetic-repository"
+        self.repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=self.repo,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Archive Test"],
+            cwd=self.repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "archive@example.invalid"],
+            cwd=self.repo,
+            check=True,
+        )
+        (self.repo / "README.md").write_text("safe\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=self.repo,
+            capture_output=True,
+            check=True,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
     def run_command(self, *arguments: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["bash", str(ARCHIVE_COMMAND), *arguments],
-            cwd=REPOSITORY_ROOT,
+            cwd=self.repo,
             capture_output=True,
             text=True,
             check=False,
@@ -484,7 +517,11 @@ class PreflightTests(unittest.TestCase):
             "ToKeN",
         )
         for key in assignments:
-            value = "credential-value-" + key.replace("_", "-")
+            value = (
+                "AbCdEfGhIjKlMnOpQrSt1234"
+                if key.lower() == "token"
+                else "credential-value-" + key.replace("_", "-")
+            )
             with self.subTest(key=key):
                 env.write_text(
                     "{}={}\n".format(key, value), encoding="utf-8"
@@ -494,6 +531,89 @@ class PreflightTests(unittest.TestCase):
                 ) as caught:
                     self.preflight()
                 self.assertNotIn(value, str(caught.exception))
+
+    def test_secret_scanner_handles_structured_and_bearer_credentials(self) -> None:
+        examples = (
+            b'{"api_key": "real-api-key-value-123456"}',
+            b"password: correct horse battery staple",
+            b'Authorization: Bearer header.payload.signature',
+        )
+        for content in examples:
+            with self.subTest(content=content[:12]):
+                rule = archive_project.scan_secret_stream(
+                    "settings.txt", io.BytesIO(content)
+                )
+                self.assertIsNotNone(rule)
+                self.assertNotIn(
+                    content.decode("utf-8"), rule
+                )
+
+    def test_secret_scanner_ignores_ordinary_token_source_and_placeholders(self) -> None:
+        examples = (
+            b"token = parser.current_token",
+            b'const token = "punctuation-token"',
+            b'api_key = os.environ.get("API_KEY")',
+            b"password: Optional[str] = None",
+            b"password = request.password",
+            b'{"api_key": "<your-api-key>"}',
+            b"API_KEY=sk-xxxxx",
+        )
+        for content in examples:
+            with self.subTest(content=content[:16]):
+                self.assertIsNone(
+                    archive_project.scan_secret_stream(
+                        "source.py", io.BytesIO(content)
+                    )
+                )
+
+    def test_file_inventory_rejects_mutation_after_single_pass_read(self) -> None:
+        source = self.write("race.txt", b"A" * 8192)
+
+        def mutate_after_read(path: Path) -> None:
+            if path.name == source.name:
+                with path.open("ab") as stream:
+                    stream.write(b"changed")
+
+        with mock.patch.object(
+            archive_project,
+            "_after_file_read",
+            side_effect=mutate_after_read,
+            create=True,
+        ):
+            with self.assertRaisesRegex(
+                archive_project.PreflightError, "changed while being read"
+            ):
+                self.preflight()
+
+    def test_filesystem_errors_are_redacted_preflight_failures(self) -> None:
+        leaked = "/private/absolute/credential-value"
+        with mock.patch(
+            "pathlib.Path.open", side_effect=PermissionError(leaked)
+        ):
+            with self.assertRaises(archive_project.PreflightError) as caught:
+                self.preflight()
+        self.assertNotIn(leaked, str(caught.exception))
+
+        target = self.write("target.txt", "safe")
+        link = self.repo / "link"
+        link.symlink_to(target.name)
+        with mock.patch.object(
+            archive_project.os,
+            "readlink",
+            side_effect=OSError(leaked),
+        ):
+            with self.assertRaises(archive_project.PreflightError) as caught:
+                self.preflight()
+        self.assertNotIn(leaked, str(caught.exception))
+
+        with mock.patch.object(
+            archive_project,
+            "capture_identity",
+            side_effect=PermissionError(leaked),
+        ):
+            with self.assertRaises(archive_project.PreflightError) as caught:
+                self.preflight()
+        self.assertNotIn(leaked, str(caught.exception))
 
     def test_sensitive_paths_and_deleted_tracked_sensitive_paths_fail(self) -> None:
         for relative in (
@@ -630,6 +750,18 @@ class PreflightTests(unittest.TestCase):
             {".git", "node_modules", ".cache", "__pycache__", ".DS_Store"}
             <= exclusions
         )
+
+    def test_os_junk_names_only_exclude_regular_files(self) -> None:
+        self.write(".DS_Store/payload.txt", "safe")
+        self.write("target.txt", "safe")
+        (self.repo / "Thumbs.db").symlink_to("target.txt")
+
+        result = self.preflight()
+
+        entries = {item.path: item.kind for item in result.inventory}
+        self.assertEqual(entries[".DS_Store"], "directory")
+        self.assertEqual(entries[".DS_Store/payload.txt"], "file")
+        self.assertEqual(entries["Thumbs.db"], "symlink")
 
     def test_required_command_and_free_space_checks_are_patchable(self) -> None:
         with mock.patch.object(archive_project.shutil, "which", return_value=None):
