@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 
+import argparse
+import json
+import os
+import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Tuple
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_COMMAND = REPOSITORY_ROOT / "archive-project.sh"
+sys.path.insert(0, str(REPOSITORY_ROOT / "lib"))
+
+import archive_project
 
 
 class ArchiveProjectParserTests(unittest.TestCase):
@@ -69,10 +79,13 @@ class ArchiveProjectParserTests(unittest.TestCase):
     def test_archive_only_reaches_the_intentional_stub(self) -> None:
         self.assert_not_implemented(("--archive-only",))
 
-    def test_confirmed_cleanup_reaches_the_intentional_stub(self) -> None:
-        self.assert_not_implemented(
-            ("--next-project", "next-video", "--confirm-clean")
+    def test_confirmed_cleanup_on_protected_branch_is_rejected(self) -> None:
+        result = self.run_command(
+            "--next-project", "next-video", "--confirm-clean"
         )
+        self.assertEqual(result.returncode, 1, result)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("protected branch", result.stderr)
 
     def test_archive_only_rejects_next_project(self) -> None:
         self.assert_parser_error(
@@ -123,6 +136,459 @@ class ArchiveProjectParserTests(unittest.TestCase):
                     ("--archive-only", "--archive-name", archive_name),
                     "--archive-name must be a single safe directory name",
                 )
+
+
+class PreflightTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.test_root = Path(self.temporary_directory.name)
+        self.repo = self.test_root / "项目 with spaces"
+        self.repo.mkdir()
+        self.git("init", "-b", "project/current")
+        self.git("config", "user.name", "Archive Test")
+        self.git("config", "user.email", "archive@example.invalid")
+        self.write("README.md", "safe project\n")
+        self.git("add", "README.md")
+        self.git("commit", "-m", "initial")
+        self.git("branch", "main")
+        self.archive_root = self.test_root / "archives not created"
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def git(
+        self, *arguments: str, cwd: Path = None
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=cwd or self.repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def write(self, relative: str, content: object = "content\n") -> Path:
+        path = self.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(str(content), encoding="utf-8")
+        return path
+
+    def args(self, *extra: str) -> argparse.Namespace:
+        arguments = [
+            "--archive-only",
+            "--dry-run",
+            "--archive-root",
+            str(self.archive_root),
+            "--archive-name",
+            "snapshot",
+            *extra,
+        ]
+        return archive_project.parse_args(arguments)
+
+    def cleanup_args(self, *extra: str) -> argparse.Namespace:
+        return archive_project.parse_args(
+            [
+                "--next-project",
+                "下一部 Film",
+                "--confirm-clean",
+                "--dry-run",
+                "--archive-root",
+                str(self.archive_root),
+                "--archive-name",
+                "snapshot",
+                *extra,
+            ]
+        )
+
+    def preflight(self, args: argparse.Namespace = None) -> "archive_project.Preflight":
+        with mock.patch.object(
+            archive_project, "current_timestamp", return_value="20260730-120000"
+        ):
+            return archive_project.run_preflight(args or self.args(), self.repo)
+
+    def remove_git_history(self) -> None:
+        shutil.rmtree(self.repo / ".git")
+        self.git("init", "-b", "project/unborn")
+        self.git("config", "user.name", "Archive Test")
+        self.git("config", "user.email", "archive@example.invalid")
+
+    def test_requires_the_exact_safe_worktree_root(self) -> None:
+        nested = self.repo / "nested"
+        nested.mkdir()
+        for unsafe in (nested, self.repo.parent, Path("/"), Path.home()):
+            with self.subTest(path=unsafe):
+                with self.assertRaisesRegex(
+                    archive_project.PreflightError,
+                    "exact Git worktree root|unsafe source",
+                ):
+                    archive_project.discover_repository(unsafe)
+
+        state = archive_project.discover_repository(self.repo)
+        self.assertEqual(state.root, self.repo.resolve())
+
+    def test_resolves_local_base_refs_without_fetching(self) -> None:
+        main_commit = self.git("rev-parse", "main").stdout.strip()
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        state = archive_project.discover_repository(self.repo)
+        original = archive_project._run_git
+        calls = []
+
+        def recording_git(*arguments, **kwargs):
+            calls.append(arguments[1])
+            return original(*arguments, **kwargs)
+
+        with mock.patch.object(
+            archive_project, "_run_git", side_effect=recording_git
+        ):
+            preferred = archive_project.resolve_base_ref(state, None)
+        self.assertEqual(preferred.name, "origin/main")
+        self.assertEqual(preferred.commit, main_commit)
+        self.assertFalse(any("fetch" in call for call in calls))
+
+        self.git("update-ref", "-d", "refs/remotes/origin/main")
+        fallback = archive_project.resolve_base_ref(state, None)
+        explicit = archive_project.resolve_base_ref(state, "HEAD")
+        self.assertEqual(fallback.name, "main")
+        self.assertEqual(explicit.commit, main_commit)
+
+        for invalid in ("missing-ref", "README.md"):
+            with self.subTest(ref=invalid):
+                with self.assertRaisesRegex(
+                    archive_project.PreflightError, "local commit"
+                ):
+                    archive_project.resolve_base_ref(state, invalid)
+
+    def test_cleanup_rejects_protected_detached_and_unborn_states_read_only(self) -> None:
+        cases = []
+        self.git("switch", "main")
+        cases.append(("protected", self.repo))
+
+        detached = self.test_root / "detached"
+        self.git("clone", str(self.repo), str(detached), cwd=self.test_root)
+        self.git("switch", "--detach", "HEAD", cwd=detached)
+        cases.append(("detached", detached))
+
+        unborn = self.test_root / "unborn"
+        unborn.mkdir()
+        self.git("init", "-b", "project/unborn", cwd=unborn)
+        cases.append(("unborn", unborn))
+
+        for label, repository in cases:
+            archive_root = repository.parent / (label + "-archive")
+            args = archive_project.parse_args(
+                [
+                    "--next-project",
+                    "next",
+                    "--confirm-clean",
+                    "--dry-run",
+                    "--archive-root",
+                    str(archive_root),
+                    "--archive-name",
+                    "snapshot",
+                ]
+            )
+            with self.subTest(state=label):
+                with self.assertRaisesRegex(
+                    archive_project.PreflightError,
+                    "protected|detached|unborn",
+                ):
+                    archive_project.run_preflight(args, repository)
+                self.assertFalse(archive_root.exists())
+                self.assertFalse(
+                    Path(str(archive_root / "snapshot") + ".reset-result.json").exists()
+                )
+                branches = self.git(
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/heads/project/next-",
+                    cwd=repository,
+                ).stdout
+                self.assertEqual(branches, "")
+
+    def test_archive_only_supports_named_detached_and_unborn_heads(self) -> None:
+        named = self.preflight()
+        self.assertEqual(named.old_branch, "project/current")
+        self.assertIsNotNone(named.old_commit)
+
+        self.git("switch", "--detach", "HEAD")
+        detached = self.preflight()
+        self.assertIsNone(detached.old_branch)
+        self.assertIsNotNone(detached.old_commit)
+        self.assertEqual(detached.project_id, "项目-with-spaces")
+
+        self.remove_git_history()
+        unborn = self.preflight()
+        self.assertEqual(unborn.old_branch, "project/unborn")
+        self.assertIsNone(unborn.old_commit)
+        self.assertEqual(unborn.project_id, "project-unborn")
+
+    def test_project_id_prefers_config_then_branch_then_directory(self) -> None:
+        config = self.write(
+            "production/production-config.json",
+            json.dumps({"project_id": "  Café / 第一期  "}),
+        )
+        self.git("add", str(config.relative_to(self.repo)))
+        self.git("commit", "-m", "config")
+        configured = self.preflight()
+        self.assertEqual(configured.project_id, "café-第一期")
+
+        config.unlink()
+        branch = self.preflight()
+        self.assertEqual(branch.project_id, "project-current")
+
+        self.git("switch", "--detach", "HEAD")
+        directory = self.preflight()
+        self.assertEqual(directory.project_id, "项目-with-spaces")
+
+    def test_project_config_accepts_likely_identifier_keys(self) -> None:
+        for key in ("projectId", "project_id", "id"):
+            with self.subTest(key=key):
+                self.write(
+                    "production/production-config.json",
+                    json.dumps({key: "Portable_Name"}),
+                )
+                result = self.preflight()
+                self.assertEqual(result.project_id, "portable-name")
+
+    def test_cleanup_blocks_existing_or_other_worktree_branch(self) -> None:
+        new_branch = "project/下一部-film-20260730-120000"
+        self.git("branch", new_branch)
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, "branch already exists"
+        ):
+            self.preflight(self.cleanup_args())
+
+        self.git("branch", "-D", new_branch)
+        other = self.test_root / "other-worktree"
+        self.git("worktree", "add", "-b", new_branch, str(other), "main")
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, "checked out|already exists"
+        ):
+            self.preflight(self.cleanup_args())
+
+    def test_archive_and_reset_result_collisions_block(self) -> None:
+        self.archive_root.mkdir()
+        final = self.archive_root / "snapshot"
+        for collision in (final, Path(str(final) + ".reset-result.json")):
+            with self.subTest(collision=collision):
+                if collision.suffix == ".json":
+                    collision.write_text("existing", encoding="utf-8")
+                else:
+                    collision.mkdir()
+                with self.assertRaisesRegex(
+                    archive_project.PreflightError, "already exists"
+                ):
+                    self.preflight()
+                if collision.is_dir():
+                    collision.rmdir()
+                else:
+                    collision.unlink()
+
+    def test_destination_must_be_outside_source_and_name_must_be_safe(self) -> None:
+        inside = self.args()
+        inside.archive_root = str(self.repo / "archive")
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, "outside the source"
+        ):
+            self.preflight(inside)
+
+        for name in ("../escape", "nested/name", ".", "line\nbreak"):
+            with self.subTest(name=name):
+                with self.assertRaises(SystemExit):
+                    archive_project.parse_args(
+                        ["--archive-only", "--dry-run", "--archive-name", name]
+                    )
+
+    def test_tracked_env_example_is_included_and_scanned(self) -> None:
+        env = self.write(".env.example", "OPENAI_API_KEY=sk-xxxxx\n")
+        self.git("add", ".env.example")
+        self.git("commit", "-m", "example")
+        result = self.preflight()
+        self.assertIn(".env.example", {entry.path for entry in result.inventory})
+
+        env.write_text(
+            "OPENAI_API_KEY=sk-" + ("a" * 32) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, r"\.env\.example.*credential"
+        ) as caught:
+            self.preflight()
+        self.assertNotIn("sk-" + ("a" * 32), str(caught.exception))
+
+    def test_sensitive_paths_and_deleted_tracked_sensitive_paths_fail(self) -> None:
+        for relative in (
+            ".env",
+            ".env.production",
+            "private/server.pem",
+            "auth/credentials.json",
+        ):
+            with self.subTest(path=relative):
+                path = self.write(relative, "secret-value")
+                with self.assertRaisesRegex(
+                    archive_project.PreflightError, "sensitive path"
+                ) as caught:
+                    self.preflight()
+                self.assertNotIn("secret-value", str(caught.exception))
+                path.unlink()
+
+        deleted = self.write(".env.local", "historic-secret")
+        self.git("add", ".env.local")
+        self.git("commit", "-m", "tracked sensitive")
+        deleted.unlink()
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, r"\.env\.local.*sensitive path"
+        ) as caught:
+            self.preflight()
+        self.assertNotIn("historic-secret", str(caught.exception))
+
+    def test_spaces_and_unicode_are_allowed_but_control_characters_fail(self) -> None:
+        self.write("镜头 folder/clip one.txt", "safe")
+        result = self.preflight()
+        self.assertIn(
+            "镜头 folder/clip one.txt", {entry.path for entry in result.inventory}
+        )
+
+        bad = self.write("bad\nname.txt", "safe")
+        try:
+            with self.assertRaisesRegex(
+                archive_project.PreflightError, "control character"
+            ):
+                self.preflight()
+        finally:
+            bad.unlink()
+
+    def test_deleted_tracked_control_character_path_fails(self) -> None:
+        bad = self.write("deleted\nname.txt", "safe")
+        self.git("add", str(bad.relative_to(self.repo)))
+        self.git("commit", "-m", "control path")
+        bad.unlink()
+
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, "control character"
+        ):
+            self.preflight()
+
+    def test_symlink_rules_and_special_file_rejection(self) -> None:
+        target = self.write("assets/target.txt", "safe")
+        link = self.repo / "link"
+        link.symlink_to("assets/target.txt")
+        result = self.preflight()
+        entry = next(item for item in result.inventory if item.path == "link")
+        self.assertEqual(entry.kind, "symlink")
+        self.assertEqual(entry.link_target, "assets/target.txt")
+        link.unlink()
+
+        external = self.test_root / "external.txt"
+        external.write_text("safe", encoding="utf-8")
+        cases = (
+            str(external),
+            "../external.txt",
+            "missing.txt",
+            "node_modules/package/file.js",
+        )
+        for target_value in cases:
+            with self.subTest(target=target_value):
+                link.symlink_to(target_value)
+                with self.assertRaisesRegex(
+                    archive_project.PreflightError,
+                    "symlink|absolute|outside|dangling|excluded",
+                ):
+                    self.preflight()
+                link.unlink()
+
+        fifo = self.repo / "pipe"
+        os.mkfifo(str(fifo))
+        try:
+            with self.assertRaisesRegex(
+                archive_project.PreflightError, "special file"
+            ):
+                self.preflight()
+        finally:
+            fifo.unlink()
+
+    def test_inventory_records_standard_exclusions(self) -> None:
+        self.write("node_modules/pkg/index.js")
+        self.write(".cache/tool/state")
+        self.write("__pycache__/module.pyc", b"\0")
+        self.write(".DS_Store")
+        result = self.preflight()
+        exclusions = {item.path for item in result.exclusions}
+        self.assertTrue(
+            {".git", "node_modules", ".cache", "__pycache__", ".DS_Store"}
+            <= exclusions
+        )
+
+    def test_required_command_and_free_space_checks_are_patchable(self) -> None:
+        with mock.patch.object(archive_project.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(
+                archive_project.PreflightError, "required command"
+            ):
+                self.preflight()
+
+        disk_usage = shutil.disk_usage(self.test_root)
+        with mock.patch.object(
+            archive_project.shutil,
+            "disk_usage",
+            return_value=type(disk_usage)(
+                disk_usage.total, disk_usage.used, 0
+            ),
+        ):
+            with self.assertRaisesRegex(
+                archive_project.PreflightError, "free space"
+            ):
+                self.preflight()
+
+    def test_captures_source_and_nearest_archive_parent_identity(self) -> None:
+        result = self.preflight()
+        source_stat = self.repo.stat()
+        parent_stat = self.test_root.stat()
+        self.assertEqual(
+            (result.source_identity.device, result.source_identity.inode),
+            (source_stat.st_dev, source_stat.st_ino),
+        )
+        self.assertEqual(
+            (
+                result.archive_parent_identity.device,
+                result.archive_parent_identity.inode,
+            ),
+            (parent_stat.st_dev, parent_stat.st_ino),
+        )
+
+    def test_dry_run_prints_plan_and_creates_nothing(self) -> None:
+        before_refs = self.git(
+            "for-each-ref", "--format=%(refname)"
+        ).stdout
+        result = subprocess.run(
+            [
+                "bash",
+                str(ARCHIVE_COMMAND),
+                "--next-project",
+                "next",
+                "--confirm-clean",
+                "--dry-run",
+                "--archive-root",
+                str(self.archive_root),
+                "--archive-name",
+                "snapshot",
+            ],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result)
+        self.assertIn("source:", result.stdout)
+        self.assertIn("archive:", result.stdout)
+        self.assertIn("base commit:", result.stdout)
+        self.assertIn("new branch:", result.stdout)
+        self.assertFalse(self.archive_root.exists())
+        self.assertEqual(
+            self.git("for-each-ref", "--format=%(refname)").stdout,
+            before_refs,
+        )
 
 
 if __name__ == "__main__":
