@@ -81,6 +81,7 @@ _archive/<old-project-id>-<timestamp>/
 ├── recovery/
 │   ├── git-state.txt
 │   ├── tracked-changes.patch
+│   ├── binary-changes.txt
 │   ├── untracked-files.txt
 │   └── RESTORE.md
 ├── archive-manifest.json
@@ -110,16 +111,24 @@ It excludes:
 - dependency directories such as `node_modules/`;
 - package-manager, browser, build and disposable render caches;
 - operating-system junk and temporary files;
-- secret-bearing files such as `.env`, `.env.*`, private keys and authentication
-  configuration.
+- secret-bearing files such as `.env`, runtime-specific environment files,
+  private keys and authentication configuration.
+
+The exact path `.env.example` is the only environment-file template exception:
+it may be included only when Git tracks it, and its content is still subject to
+credential-pattern scanning. The exception does not extend to arbitrary
+`*.example`, `.env.local`, `.env.production`, or similarly named runtime files.
 
 Every exclusion rule and every excluded path is recorded in
 `archive-manifest.json`. Files must never be skipped silently.
 
 Included symbolic links are copied as links and are never dereferenced. A link
-is accepted only when its resolved target is an existing path inside the source
-worktree. Absolute, dangling and worktree-external links are hard failures.
-Included sockets, devices, FIFOs and other special files are also hard failures.
+is accepted only when its complete link chain resolves inside the source
+worktree and every link and final target in that chain belongs to the protected
+payload. Links into an excluded dependency, cache or sensitive path are hard
+failures because they would be broken in the archive. Absolute, dangling and
+worktree-external links are also hard failures. Included sockets, devices,
+FIFOs and other special files are hard failures.
 
 ### Recovery evidence
 
@@ -132,9 +141,12 @@ Included sockets, devices, FIFOs and other special files are also hard failures.
 - porcelain Git status;
 - timestamp and script version.
 
-`tracked-changes.patch` is generated as a binary-safe Git diff of tracked
-working-tree and index changes. `untracked-files.txt` lists untracked paths.
-The complete file content remains available under `snapshot/`.
+`tracked-changes.patch` is generated as a text-only Git diff of tracked
+working-tree and index changes. It must not embed Git binary-patch payloads.
+Changed binary paths are listed in `binary-changes.txt`; their current content
+is preserved by `snapshot/`, and deleted binary content is recoverable only
+from the recorded original Git commit. `untracked-files.txt` lists untracked
+paths. The complete current file content remains available under `snapshot/`.
 
 Cleanup requires a named, existing, non-protected branch. Detached HEAD and an
 unborn branch are supported by archive-only mode but are hard blockers for
@@ -152,7 +164,8 @@ The repository's original branch and commit history are not deleted.
 ## Manifest and verification
 
 `archive-manifest.json` is deterministic apart from explicitly recorded runtime
-metadata. It contains:
+metadata. It is serialized as canonical UTF-8 JSON with sorted keys and fixed
+separators. It contains:
 
 - schema version and script version;
 - archive creation time;
@@ -167,9 +180,11 @@ metadata. It contains:
 - warnings and non-fatal observations.
 
 The protected payload includes all entries beneath `snapshot/` and `recovery/`.
-`SHA256SUMS` contains hashes for all protected regular files and domain-separated
-hashes of accepted symbolic-link targets in a standard sorted format. Paths
-containing unsupported control characters cause a safe failure.
+`SHA256SUMS` contains hashes for protected regular files only in standard sorted
+format. Symbolic-link types, modes and link targets are bound by the canonical
+manifest and checked by the Python verifier; standard checksum tools are not
+claimed to validate link metadata. Paths containing unsupported control
+characters cause a safe failure.
 
 After copying, the tool recomputes every destination hash and validates file
 types, modes and link targets. `archive-verification.json` records expected and
@@ -201,6 +216,18 @@ rule identifier; it never prints the matching content. There is no general
 command-line bypass. Users must relocate or remove sensitive files themselves
 and rerun the command.
 
+Secret scanning covers both copied source content and every generated recovery
+or metadata file before the staging archive is committed, including patches,
+Git state, file lists, restoration instructions, manifest, checksum list and
+verification report. Generated output is scanned before it can be printed as
+well. A match deletes the staging directory and fails safely.
+
+Opaque binary patch payloads are forbidden because text pattern scanning cannot
+reliably inspect them. A tracked binary change is represented by its path,
+original commit and current snapshot file rather than embedded patch bytes.
+Any change involving a known sensitive path remains a hard failure even when
+the file is deleted from the current worktree.
+
 Remote URLs are redacted before recording. URLs containing userinfo, access
 tokens or credential-like query parameters must never be emitted verbatim.
 
@@ -215,12 +242,14 @@ Before creating files, the script:
 3. resolves the requested base ref to a fixed local commit without fetching;
 4. validates that the new branch does not exist;
 5. validates and canonicalizes the archive destination;
-6. inventories included, excluded and sensitive paths;
-7. rejects unsupported links, special files and unsafe path names;
-8. captures a frozen source inventory containing every non-disposable entry's
+6. confirms that neither the final archive nor its adjacent reset-result path
+   already exists;
+7. inventories included, excluded and sensitive paths;
+8. rejects unsupported links, special files and unsafe path names;
+9. captures a frozen source inventory containing every non-disposable entry's
    type, mode, size, link target or hash, plus exact Git status;
-9. checks required commands and available destination space;
-10. prints the resolved old project, archive destination, base commit and new
+10. checks required commands and available destination space;
+11. prints the resolved old project, archive destination, base commit and new
    branch.
 
 `--dry-run` exits successfully after this phase and performs no writes.
@@ -248,6 +277,12 @@ addition, deletion or change preserves the completed archive but refuses
 cleanup. Changes beneath explicitly disposable cache directories may be
 reported without blocking because those directories are neither archived nor
 recoverable project evidence.
+
+It also reopens the committed archive through its final path and revalidates the
+entire protected payload against the manifest: entry set, type, mode, size,
+regular-file hash, and symbolic-link target. Merely recomputing the manifest and
+checksum-list identity is insufficient. Any post-rename archive mutation blocks
+all destructive actions.
 
 ### Phase 3: workspace reset
 
@@ -282,6 +317,13 @@ The tool then:
 11. writes the adjacent reset-result file with the archive identity, old and new
    refs, cleanup result and final workspace status.
 
+The reset-result file is written to a uniquely named temporary file in the
+archive parent and atomically renamed without overwrite. Its final path is
+reserved during preflight. If recording fails after the workspace reset has
+succeeded, the command returns non-zero and reports both the actual verified
+workspace state and the result-recording failure; it must not describe the reset
+itself as failed or attempt to recreate deleted project files.
+
 The reset has no persistent local-file whitelist: a reusable configuration that
 must survive belongs in the tracked `main` template, while secrets must live
 outside the project directory.
@@ -304,6 +346,9 @@ a glob as a cleanup target.
   non-zero status, write a failed adjacent reset-result when possible, print the
   archive and recovery-document paths, and do not claim that the workspace is
   ready.
+- **Reset succeeds but result recording fails:** return non-zero, report that
+  the workspace itself was verified clean, preserve the immutable archive, and
+  never overwrite an existing result file.
 
 The script should perform automatic rollback only when it can prove the
 destination and source states. It must prefer a verified archive plus explicit
@@ -370,12 +415,19 @@ Tests should cover at least:
 - preservation of spaces and Unicode in filenames;
 - exclusions recorded without silent omission;
 - refusal to clean when excluded sensitive files exist;
+- inclusion of the exact tracked `.env.example` template while continuing to
+  scan its content, and refusal of runtime `.env.*` files;
 - redaction of credential-bearing remote URLs;
 - hard failure for embedded credential matches without leaking matched values;
+- hard failure when a generated recovery patch or metadata file contains a
+  credential pattern;
+- text-only representation of tracked binary changes without opaque patch data;
 - preservation of internal symbolic links without dereferencing;
-- refusal of external, absolute and dangling links and included special files;
+- refusal of links into excluded payload, external/absolute/dangling links and
+  included special files;
 - source changes during copying being detected by destination verification;
 - source changes after archive commit refusing cleanup;
+- formal-archive payload mutation after atomic rename refusing cleanup;
 - simulated copy and verification failures leaving the source unchanged;
 - refusal on protected branches;
 - refusal from detached HEAD and unborn branches in cleanup mode;
@@ -386,6 +438,8 @@ Tests should cover at least:
 - final absence of tracked changes, untracked files and ignored files;
 - final clean worktree and absence of project-only fixture paths;
 - no overwrite of an existing archive;
+- no overwrite and atomic creation of the adjacent reset-result file;
+- accurate non-zero reporting when reset succeeds but result recording fails;
 - traversal rejection in `--archive-name` and safe resolution of nonexistent
   destination paths;
 - macOS-compatible operation using Python standard-library file primitives;
