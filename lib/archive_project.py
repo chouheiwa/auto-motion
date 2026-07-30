@@ -901,10 +901,17 @@ def _redact_remote_url(value: str) -> str:
                 "[REDACTED]" if parsed.fragment else "",
             )
         )
-    elif re.match(r"^[^/@:\s]+@[^:\s]+:", value):
-        redacted = "[REDACTED]@" + value.split("@", 1)[1]
     else:
-        redacted = value
+        scp = re.match(
+            r"^[^@/\s]+@(?P<host>\[[^\]]+\]|[^:\s]+):(?P<path>.+)$",
+            value,
+        )
+        if scp:
+            redacted = "[REDACTED]@{}:{}".format(
+                scp.group("host"), scp.group("path")
+            )
+        else:
+            redacted = value
     for _, pattern in SECRET_PATTERNS:
         redacted = pattern.sub(b"[REDACTED]", redacted.encode("utf-8")).decode(
             "utf-8"
@@ -976,9 +983,9 @@ def _diff_bytes(
             for path in sorted(excluded_paths)
         )
     elif mode == "name-status":
-        arguments.extend(["--name-status", "-z", "--diff-filter=MD", "--"])
+        arguments.extend(["--name-status", "-z", "--diff-filter=AMD", "--"])
     elif mode == "numstat":
-        arguments.extend(["--numstat", "-z", "--diff-filter=MD", "--"])
+        arguments.extend(["--numstat", "-z", "--diff-filter=AMD", "--"])
     else:
         raise ValueError("unsupported Git diff mode")
     return _run_git(source, arguments).stdout
@@ -1015,10 +1022,16 @@ def _binary_changes(
         path = tokens[index + 1]
         if path not in binary_paths:
             continue
+        if status == "A":
+            change = "added"
+        elif status == "D":
+            change = "deleted"
+        else:
+            change = "modified"
         changes.append(
             {
                 "layer": "index" if cached else "worktree",
-                "change": "deleted" if status == "D" else "modified",
+                "change": change,
                 "path": _decode_git_path(path),
             }
         )
@@ -1041,7 +1054,8 @@ def _binary_report(
         "",
         (
             "Binary payloads are intentionally omitted from the patches. "
-            "Existing modified files are preserved by the archive snapshot."
+            "Current added and modified files are preserved by the archive "
+            "snapshot."
         ),
     ]
     if original_commit:
@@ -1112,10 +1126,11 @@ empty Git repository. Do not copy the full snapshot before applying patches.
    JSON-quoted path; use a path-aware tool instead of parsing it as shell text.
 
 Binary payloads are intentionally absent from the patches. Use each binary
-entry's `index` or `worktree` layer label to stage a copied modification or
-deletion only when appropriate. If one binary path changed in both layers, the
-snapshot preserves only its final current binary content; inspect and reconcile
-that path manually using the original commit named in `binary-changes.txt`.
+entry's `index` or `worktree` layer label to stage a copied addition,
+modification, or deletion only when appropriate. If one binary path changed in
+both layers, the snapshot preserves only its final current binary content;
+inspect and reconcile that path manually using the original commit named in
+`binary-changes.txt`.
 
 Empty patch files require no action. Review `git status` and the resulting diff
 before committing. Destructive reset or cleanup commands are unnecessary.

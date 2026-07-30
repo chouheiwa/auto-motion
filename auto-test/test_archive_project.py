@@ -1018,6 +1018,24 @@ class RecoveryEvidenceTests(unittest.TestCase):
         self.assertNotIn("query-secret", state_text)
         self.assertIn("[REDACTED]", state_text)
 
+    def test_scp_remote_colon_userinfo_is_structurally_redacted(self) -> None:
+        password = "scp-password-" + ("A1b2" * 4)
+        self.git(
+            "remote",
+            "add",
+            "backup",
+            "encoded%3Auser:{}@host.invalid:team/repo.git".format(password),
+        )
+
+        recovery, _ = self.generate()
+        state_text = (recovery / "git-state.json").read_text(encoding="utf-8")
+        state = json.loads(state_text)
+        url = state["remotes"][0]["urls"][0]
+
+        self.assertNotIn(password, state_text)
+        self.assertNotIn("encoded%3Auser", state_text)
+        self.assertEqual(url, "[REDACTED]@host.invalid:team/repo.git")
+
     def test_unborn_head_state_is_explicit_and_restore_guide_is_safe(self) -> None:
         shutil.rmtree(self.repo / ".git")
         self.git("init", "-b", "project/unborn")
@@ -1108,6 +1126,56 @@ class RecoveryEvidenceTests(unittest.TestCase):
             replay_git(
                 "ls-files", "--others", "--exclude-standard"
             ).stdout.splitlines(),
+        )
+
+    def test_unborn_staged_binary_replay_uses_snapshot_payload(self) -> None:
+        shutil.rmtree(self.repo / ".git")
+        self.git("init", "-b", "project/unborn")
+        self.git("config", "user.name", "Archive Test")
+        self.git("config", "user.email", "archive@example.invalid")
+        self.write("seed.txt", "staged text\n")
+        self.write("new binary.bin", b"\x00snapshot-binary\xfb")
+        self.git("add", "seed.txt", "new binary.bin")
+
+        recovery, preflight = self.generate()
+        index_patch = recovery / "index-changes.patch"
+        report = (recovery / "binary-changes.txt").read_text(encoding="utf-8")
+        replay = self.test_root / "unborn replay"
+        replay.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "project/replay"],
+            cwd=replay,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        def replay_git(*arguments: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", *arguments],
+                cwd=replay,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+        self.assertIsNone(preflight.old_commit)
+        self.assertIn('added (index): "new binary.bin"', report)
+        self.assertNotIn(b"new binary.bin", index_patch.read_bytes())
+        self.assertNotIn(b"Binary files", index_patch.read_bytes())
+        replay_git("apply", "--check", str(index_patch))
+        replay_git("apply", "--index", str(index_patch))
+        shutil.copy2(
+            self.repo / "new binary.bin", replay / "new binary.bin"
+        )
+        replay_git("add", "--", "new binary.bin")
+
+        status = replay_git("status", "--porcelain=v1", "-z").stdout
+        self.assertIn("A  seed.txt\0", status)
+        self.assertIn("A  new binary.bin\0", status)
+        self.assertEqual(
+            (replay / "new binary.bin").read_bytes(),
+            (self.repo / "new binary.bin").read_bytes(),
         )
 
     def test_generated_historic_credential_fails_closed_without_disclosure(
