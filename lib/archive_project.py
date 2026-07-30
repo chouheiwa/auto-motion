@@ -119,11 +119,17 @@ SECRET_PATTERNS = (
     (
         "credential-assignment",
         re.compile(
-            br"(?i)(?:password|passwd|secret|access[_-]?token)"
-            br"\s*[:=]\s*[\"']?[^\s\"']{12,}"
+            br"(?i)(?:api[_-]?key|access[_-]?token|token|"
+            br"password|passwd|secret)"
+            br"\s*[:=]\s*[\"']?"
+            br"([A-Za-z0-9_./+<>{}@:$-]{12,})(?=$|[\s\"'])"
         ),
     ),
 )
+EXACT_CREDENTIAL_PLACEHOLDERS = {
+    b"<your-api-key>",
+    b"<your-api-key>\\n",
+}
 
 
 def sanitize_project_id(value: str) -> str:
@@ -225,9 +231,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def _run_git(
     cwd: Path, arguments: Sequence[str], check: bool = True
 ) -> subprocess.CompletedProcess:
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     result = subprocess.run(
         ["git", *arguments],
         cwd=str(cwd),
+        env=environment,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -317,8 +326,8 @@ def scan_secret_path(path: str, tracked: Set[str]) -> Optional[str]:
         return None if path in tracked else "untracked-env-template"
     if name == ".env" or name.startswith(".env."):
         return "environment-file"
-    if "private" in components:
-        return "private-path"
+    if components & {"private", "auth"}:
+        return "private-or-auth-path"
     if name in {
         "credentials",
         "credentials.json",
@@ -342,8 +351,15 @@ def scan_secret_stream(path: str, stream: BinaryIO) -> Optional[str]:
             return None
         sample = overlap + chunk
         for rule, pattern in SECRET_PATTERNS:
-            if pattern.search(sample):
-                return rule
+            matches = tuple(pattern.finditer(sample))
+            if not matches:
+                continue
+            if rule == "credential-assignment" and all(
+                match.group(1) in EXACT_CREDENTIAL_PLACEHOLDERS
+                for match in matches
+            ):
+                continue
+            return rule
         overlap = sample[-512:]
 
 
@@ -361,36 +377,63 @@ def _is_within(child: Path, parent: Path) -> bool:
 def validate_link_chain(
     root: Path, path: Path, included: Set[str]
 ) -> str:
-    target = os.readlink(str(path))
-    if os.path.isabs(target):
-        raise PreflightError(
-            "symlink '{}' has an absolute target".format(
-                path.relative_to(root).as_posix()
-            )
-        )
-    try:
-        resolved = path.resolve(strict=True)
-    except (FileNotFoundError, RuntimeError, OSError):
-        raise PreflightError(
-            "symlink '{}' is dangling or cyclic".format(
-                path.relative_to(root).as_posix()
-            )
-        )
     root_resolved = root.resolve()
-    if not _is_within(resolved, root_resolved):
-        raise PreflightError(
-            "symlink '{}' resolves outside the source".format(
-                path.relative_to(root).as_posix()
+    relative_path = path.relative_to(root).as_posix()
+    initial_target = os.readlink(str(path))
+    current = root_resolved
+    pending = list(path.relative_to(root).parts)
+    visited = set()
+
+    while pending:
+        component = pending.pop(0)
+        if component in ("", "."):
+            continue
+        if component == "..":
+            current = current.parent
+            if not _is_within(current, root_resolved):
+                raise PreflightError(
+                    "symlink '{}' has an outside chain hop".format(
+                        relative_path
+                    )
+                )
+            continue
+        candidate = current / component
+        if not _is_within(candidate, root_resolved):
+            raise PreflightError(
+                "symlink '{}' has an outside chain hop".format(relative_path)
             )
-        )
-    resolved_relative = resolved.relative_to(root_resolved).as_posix()
-    if resolved_relative not in included:
-        raise PreflightError(
-            "symlink '{}' targets an excluded path".format(
-                path.relative_to(root).as_posix()
+        candidate_relative = candidate.relative_to(
+            root_resolved
+        ).as_posix()
+        if candidate_relative not in included:
+            raise PreflightError(
+                "symlink '{}' has an excluded chain hop".format(
+                    relative_path
+                )
             )
-        )
-    return target
+        try:
+            metadata = candidate.lstat()
+        except OSError:
+            raise PreflightError(
+                "symlink '{}' is dangling".format(relative_path)
+            )
+        if not stat.S_ISLNK(metadata.st_mode):
+            current = candidate
+            continue
+        if candidate in visited:
+            raise PreflightError(
+                "symlink '{}' is cyclic".format(relative_path)
+            )
+        visited.add(candidate)
+        target = os.readlink(str(candidate))
+        if os.path.isabs(target):
+            raise PreflightError(
+                "symlink '{}' has an absolute target".format(relative_path)
+            )
+        pending = list(Path(target).parts) + pending
+        current = candidate.parent
+
+    return initial_target
 
 
 def _hash_file(path: Path) -> str:
@@ -606,11 +649,17 @@ def run_preflight(
         base = ResolvedRef("(unavailable)", "")
     project_id = _project_id(repo)
 
-    archive_root = (
+    archive_root_input = (
         Path(args.archive_root).expanduser()
         if args.archive_root
         else repo.root.parent / "_archive"
-    ).resolve()
+    )
+    if (
+        os.path.lexists(str(archive_root_input))
+        and not archive_root_input.is_dir()
+    ):
+        raise PreflightError("existing archive root must be a directory")
+    archive_root = archive_root_input.resolve()
     if _is_within(archive_root, repo.root):
         raise PreflightError(
             "archive destination must be outside the source worktree"
@@ -620,11 +669,11 @@ def run_preflight(
     )
     final_archive = archive_root / archive_name
     reset_result = Path(str(final_archive) + ".reset-result.json")
-    if final_archive.exists():
+    if os.path.lexists(str(final_archive)):
         raise PreflightError(
             "final archive already exists: {}".format(final_archive)
         )
-    if reset_result.exists():
+    if os.path.lexists(str(reset_result)):
         raise PreflightError(
             "reset result already exists: {}".format(reset_result)
         )

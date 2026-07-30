@@ -261,6 +261,23 @@ class PreflightTests(unittest.TestCase):
                 ):
                     archive_project.resolve_base_ref(state, invalid)
 
+    def test_preflight_git_inspection_does_not_refresh_the_index(self) -> None:
+        index = self.repo / ".git" / "index"
+        readme = self.repo / "README.md"
+        current = readme.stat()
+        os.utime(
+            str(readme),
+            ns=(
+                current.st_atime_ns,
+                current.st_mtime_ns + 5_000_000_000,
+            ),
+        )
+        before = index.stat().st_mtime_ns
+
+        self.preflight()
+
+        self.assertEqual(index.stat().st_mtime_ns, before)
+
     def test_cleanup_rejects_protected_detached_and_unborn_states_read_only(self) -> None:
         cases = []
         self.git("switch", "main")
@@ -387,6 +404,19 @@ class PreflightTests(unittest.TestCase):
                 else:
                     collision.unlink()
 
+    def test_dangling_symlink_archive_collisions_block(self) -> None:
+        self.archive_root.mkdir()
+        final = self.archive_root / "snapshot"
+        reset_result = Path(str(final) + ".reset-result.json")
+        for collision in (final, reset_result):
+            with self.subTest(collision=collision):
+                collision.symlink_to("missing-target")
+                with self.assertRaisesRegex(
+                    archive_project.PreflightError, "already exists"
+                ):
+                    self.preflight()
+                collision.unlink()
+
     def test_destination_must_be_outside_source_and_name_must_be_safe(self) -> None:
         inside = self.args()
         inside.archive_root = str(self.repo / "archive")
@@ -401,6 +431,14 @@ class PreflightTests(unittest.TestCase):
                     archive_project.parse_args(
                         ["--archive-only", "--dry-run", "--archive-name", name]
                     )
+
+    def test_existing_archive_root_must_be_a_directory(self) -> None:
+        self.archive_root.write_text("not a directory", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, "archive root.*directory"
+        ):
+            self.preflight()
 
     def test_tracked_env_example_is_included_and_scanned(self) -> None:
         env = self.write(".env.example", "OPENAI_API_KEY=sk-xxxxx\n")
@@ -418,6 +456,33 @@ class PreflightTests(unittest.TestCase):
             self.preflight()
         self.assertNotIn("sk-" + ("a" * 32), str(caught.exception))
 
+    def test_tracked_env_example_rejects_credential_assignments_redacted(self) -> None:
+        env = self.write(".env.example", "API_KEY=sk-xxxxx\n")
+        self.git("add", ".env.example")
+        self.git("commit", "-m", "safe placeholder")
+        env.write_text("API_KEY=<your-api-key>\n", encoding="utf-8")
+        self.assertIn(
+            ".env.example",
+            {entry.path for entry in self.preflight().inventory},
+        )
+        assignments = (
+            "API_KEY",
+            "api-key",
+            "ACCESS_TOKEN",
+            "ToKeN",
+        )
+        for key in assignments:
+            value = "credential-value-" + key.replace("_", "-")
+            with self.subTest(key=key):
+                env.write_text(
+                    "{}={}\n".format(key, value), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    archive_project.PreflightError, "credential"
+                ) as caught:
+                    self.preflight()
+                self.assertNotIn(value, str(caught.exception))
+
     def test_sensitive_paths_and_deleted_tracked_sensitive_paths_fail(self) -> None:
         for relative in (
             ".env",
@@ -433,6 +498,10 @@ class PreflightTests(unittest.TestCase):
                     self.preflight()
                 self.assertNotIn("secret-value", str(caught.exception))
                 path.unlink()
+                parent = path.parent
+                while parent != self.repo and not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
 
         deleted = self.write(".env.local", "historic-secret")
         self.git("add", ".env.local")
@@ -443,6 +512,14 @@ class PreflightTests(unittest.TestCase):
         ) as caught:
             self.preflight()
         self.assertNotIn("historic-secret", str(caught.exception))
+
+    def test_auth_path_component_is_sensitive(self) -> None:
+        self.write("auth/session.json", "safe")
+
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, "sensitive path"
+        ):
+            self.preflight()
 
     def test_spaces_and_unicode_are_allowed_but_control_characters_fail(self) -> None:
         self.write("镜头 folder/clip one.txt", "safe")
@@ -508,6 +585,27 @@ class PreflightTests(unittest.TestCase):
                 self.preflight()
         finally:
             fifo.unlink()
+
+    def test_symlink_chain_rejects_excluded_hops_and_external_returns(self) -> None:
+        self.write("assets/target.txt", "safe")
+        excluded = self.repo / "node_modules"
+        excluded.mkdir()
+        (excluded / "bridge").symlink_to("../assets/target.txt")
+        link = self.repo / "link"
+        link.symlink_to("node_modules/bridge")
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, "excluded"
+        ):
+            self.preflight()
+        link.unlink()
+
+        outside_return = self.test_root / "outside-return"
+        outside_return.symlink_to(self.repo / "assets" / "target.txt")
+        link.symlink_to("../outside-return")
+        with self.assertRaisesRegex(
+            archive_project.PreflightError, "outside"
+        ):
+            self.preflight()
 
     def test_inventory_records_standard_exclusions(self) -> None:
         self.write("node_modules/pkg/index.js")
