@@ -3,6 +3,7 @@
 import argparse
 import re
 import sys
+import unicodedata
 from typing import Optional, Sequence
 
 
@@ -13,6 +14,7 @@ def sanitize_project_id(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Create a verified project archive and optionally prepare the "
             "worktree for a new project."
@@ -63,9 +65,14 @@ def parse_args(
     args = parser.parse_args(argv)
 
     if args.archive_name is not None and (
-        args.archive_name in (".", "..")
+        not args.archive_name.strip()
+        or args.archive_name in (".", "..")
         or "/" in args.archive_name
         or "\\" in args.archive_name
+        or any(
+            unicodedata.category(character) == "Cc"
+            for character in args.archive_name
+        )
     ):
         parser.error("--archive-name must be a single safe directory name")
 

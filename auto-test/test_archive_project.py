@@ -28,6 +28,16 @@ class ArchiveProjectParserTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result)
         self.assertIn(expected_message, result.stderr)
 
+    def assert_not_implemented(self, arguments: Tuple[str, ...]) -> None:
+        result = self.run_command(*arguments)
+
+        self.assertEqual(result.returncode, 1, result)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "archive-project: execution is not implemented yet\n",
+        )
+
     def test_help_describes_the_command_contract(self) -> None:
         result = self.run_command("--help")
 
@@ -50,10 +60,30 @@ class ArchiveProjectParserTests(unittest.TestCase):
             "unrecognized arguments: --not-a-real-option",
         )
 
+    def test_near_miss_flags_are_not_abbreviated(self) -> None:
+        self.assert_parser_error(
+            ("--confirm-clea",),
+            "unrecognized arguments: --confirm-clea",
+        )
+
+    def test_archive_only_reaches_the_intentional_stub(self) -> None:
+        self.assert_not_implemented(("--archive-only",))
+
+    def test_confirmed_cleanup_reaches_the_intentional_stub(self) -> None:
+        self.assert_not_implemented(
+            ("--next-project", "next-video", "--confirm-clean")
+        )
+
     def test_archive_only_rejects_next_project(self) -> None:
         self.assert_parser_error(
             ("--archive-only", "--next-project", "next-video"),
             "--archive-only cannot be combined with --next-project",
+        )
+
+    def test_archive_only_rejects_cleanup_confirmation(self) -> None:
+        self.assert_parser_error(
+            ("--archive-only", "--confirm-clean"),
+            "--archive-only cannot be combined with --confirm-clean",
         )
 
     def test_cleanup_requires_explicit_confirmation(self) -> None:
@@ -75,7 +105,19 @@ class ArchiveProjectParserTests(unittest.TestCase):
         )
 
     def test_archive_name_rejects_unsafe_values(self) -> None:
-        for archive_name in ("nested/name", r"nested\name", ".", ".."):
+        for archive_name in (
+            "",
+            "   ",
+            "nested/name",
+            r"nested\name",
+            ".",
+            "..",
+            "line\nbreak",
+            "tab\tname",
+            "unit\x1fname",
+            "delete\x7fname",
+            "c1\u0085name",
+        ):
             with self.subTest(archive_name=archive_name):
                 self.assert_parser_error(
                     ("--archive-only", "--archive-name", archive_name),
