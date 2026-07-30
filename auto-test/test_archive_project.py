@@ -1038,6 +1038,76 @@ class RecoveryEvidenceTests(unittest.TestCase):
         self.assertNotIn("git reset --hard", restore)
         self.assertNotIn("git clean", restore)
 
+    def test_restore_guide_separates_snapshot_from_operational_replay(
+        self,
+    ) -> None:
+        self.write("notes.txt", "staged layer\n")
+        self.git("add", "notes.txt")
+        self.write("notes.txt", "staged layer\nworktree layer\n")
+        self.write("modified.bin", b"\x00current-binary\xfc")
+        self.write("loose file.txt", "untracked\n")
+        recovery, preflight = self.generate()
+        restore = (recovery / "RESTORE.md").read_text(encoding="utf-8")
+        replay = self.test_root / "history replay"
+        subprocess.run(
+            ["git", "clone", "--no-checkout", str(self.repo), str(replay)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--detach", preflight.old_commit],
+            cwd=replay,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        def replay_git(*arguments: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", *arguments],
+                cwd=replay,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+        index_patch = recovery / "index-changes.patch"
+        worktree_patch = recovery / "worktree-changes.patch"
+        replay_git("apply", "--check", str(index_patch))
+        replay_git("apply", "--index", str(index_patch))
+        replay_git("apply", "--check", str(worktree_patch))
+        replay_git("apply", str(worktree_patch))
+        shutil.copy2(self.repo / "modified.bin", replay / "modified.bin")
+        shutil.copy2(self.repo / "loose file.txt", replay / "loose file.txt")
+
+        self.assertIn("Strategy A", restore)
+        self.assertIn("Do not apply either patch", restore)
+        self.assertIn("Strategy B", restore)
+        self.assertIn("recorded source commit", restore)
+        self.assertIn("copy only", restore.lower())
+        self.assertIn("untracked-files.txt", restore)
+        self.assertIn("current binary", restore.lower())
+        self.assertEqual(
+            (replay / "notes.txt").read_text(encoding="utf-8"),
+            "staged layer\nworktree layer\n",
+        )
+        cached = replay_git("diff", "--cached", "--", "notes.txt").stdout
+        unstaged = replay_git("diff", "--", "notes.txt").stdout
+        self.assertIn("+staged layer", cached)
+        self.assertNotIn("worktree layer", cached)
+        self.assertIn("+worktree layer", unstaged)
+        self.assertEqual(
+            (replay / "modified.bin").read_bytes(),
+            (self.repo / "modified.bin").read_bytes(),
+        )
+        self.assertIn(
+            "loose file.txt",
+            replay_git(
+                "ls-files", "--others", "--exclude-standard"
+            ).stdout.splitlines(),
+        )
+
     def test_generated_historic_credential_fails_closed_without_disclosure(
         self,
     ) -> None:

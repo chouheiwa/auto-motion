@@ -1077,20 +1077,42 @@ def _binary_report(
 def _restore_guide() -> bytes:
     return b"""# Restore this archive safely
 
-Work in a new, disposable Git worktree or clone. Read `git-state.json` first and
-verify the recorded source commit and base commit before making changes.
+Read `git-state.json` first. Verify the recorded source commit and base commit,
+then choose exactly one strategy below. Work in a new, disposable destination.
 
-1. Restore the archived snapshot into the chosen worktree without overwriting
-   unrelated files.
-2. Review `untracked-files.txt`; each line is a JSON-quoted path.
-3. Inspect `binary-changes.txt`. Binary payloads are not embedded in patches.
-4. Check the staged layer with:
+## Strategy A: direct snapshot restore
+
+Copy the archived snapshot payload into an empty destination. This reproduces
+the final filesystem state, including untracked and current binary files, but
+does not reconstruct which tracked changes were staged.
+
+Do not apply either patch after copying the snapshot: both changes are already
+present in the copied files. Review the result before committing or replacing
+any existing work.
+
+## Strategy B: history-preserving replay
+
+Start with a clean clone or worktree checked out at the recorded source commit
+from `git-state.json`. For an unborn source with a null commit, start with a new
+empty Git repository. Do not copy the full snapshot before applying patches.
+
+1. Check the staged text layer:
    `git apply --check recovery/index-changes.patch`
-5. If the check succeeds, apply it with:
+2. If the check succeeds, apply it to the index and worktree:
    `git apply --index recovery/index-changes.patch`
-6. Check and apply the unstaged layer afterward:
+3. Check the unstaged text layer against that result:
    `git apply --check recovery/worktree-changes.patch`
+4. If the check succeeds, apply it without staging:
    `git apply recovery/worktree-changes.patch`
+5. Copy only the snapshot paths listed in `untracked-files.txt` and the current
+   binary files described by `binary-changes.txt`. Each untracked line is a
+   JSON-quoted path; use a path-aware tool instead of parsing it as shell text.
+
+Binary payloads are intentionally absent from the patches. Use each binary
+entry's `index` or `worktree` layer label to stage a copied modification or
+deletion only when appropriate. If one binary path changed in both layers, the
+snapshot preserves only its final current binary content; inspect and reconcile
+that path manually using the original commit named in `binary-changes.txt`.
 
 Empty patch files require no action. Review `git status` and the resulting diff
 before committing. Destructive reset or cleanup commands are unnecessary.
