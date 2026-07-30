@@ -539,6 +539,7 @@ class PreflightTests(unittest.TestCase):
             b"password: correct horse battery staple",
             b'password="correct(horse)battery-staple"',
             b"API_KEY=real-shell-key-value-123456",
+            b"token = 0123456789abcdef0123456789abcdef",
             b'Authorization: Bearer header.payload.signature',
         )
         for content in examples:

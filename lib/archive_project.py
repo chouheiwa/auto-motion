@@ -384,12 +384,18 @@ def _looks_like_real_assignment(
     ):
         return False
     if key.lower() == b"token":
-        return (
+        lowercase_hex = (
+            re.fullmatch(br"[a-f0-9]{32,}", normalized) is not None
+            and re.search(br"[a-f]", normalized) is not None
+            and re.search(br"[0-9]", normalized) is not None
+        )
+        mixed_token = (
             len(normalized) >= 24
             and any(65 <= byte <= 90 for byte in normalized)
             and any(97 <= byte <= 122 for byte in normalized)
             and any(48 <= byte <= 57 for byte in normalized)
         )
+        return lowercase_hex or mixed_token
     return len(normalized) >= 8
 
 
