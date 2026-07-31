@@ -95,6 +95,24 @@ for prompt in "$BASIC_PROMPT" "$PRODUCTION_PROMPT"; do
   done
 done
 
+archive_closeout_contracts=(
+  'archive-project\.sh'
+  '\-\-dry-run'
+  '询问用户.*归档|归档.*用户确认'
+  '共享文件|shared'
+  'ignored|忽略文件|被忽略'
+  '询问 agent|让 agent|请 agent'
+  '不得.*绕过|不要.*绕过'
+  '旧项目分支|分支和历史'
+)
+
+for prompt in "$BASIC_PROMPT" "$PRODUCTION_PROMPT"; do
+  for pattern in "${archive_closeout_contracts[@]}"; do
+    require_pattern "$pattern" "$prompt" \
+      "$(basename "$prompt") missing archive closeout contract: $pattern"
+  done
+done
+
 production_publish_contracts=(
   'expected_delivery\.sha256'
   '素材账本.*授权证据|授权证据.*素材账本'
