@@ -214,6 +214,29 @@ The reusable draft is [`templates/publish.md`](./templates/publish.md). Validate
 python3 production/tools/validate_publish.py publish.md --project-root .
 ```
 
+## Archive the Current Project
+
+After finishing one video, run from the repository root:
+
+```bash
+./archive-project.sh --dry-run
+./archive-project.sh
+```
+
+The script first moves files that exist only in the current project to
+`../_archive/<branch-timestamp>/files/`, preserving relative paths, and writes
+`MANIFEST.txt` at the archive root. After confirmation, it detaches this worktree at the `main`
+commit frozen at startup. The old project branch and its history are not
+deleted. Ask an agent to create the next project branch afterward.
+
+Use `--main-ref REF`, `--archive-root DIR`, or `--archive-name NAME` to override
+defaults, and `--yes` for automation. The command never fetches.
+
+If a file shared with `main` was modified or deleted, the command stops before
+moving anything; ask an agent to separate or resolve that change. Ignored files
+such as `.env` and caches also block the command so an agent can decide whether
+to delete, archive, or keep them. Their contents are not scanned.
+
 ## Test
 
 Run the built-in end-to-end test:
@@ -242,6 +265,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest production/tests/test_publish_cont
 .
 ├── auto-motion.conf              # Orchestrator/renderer config
 ├── run-orchestrator.sh            # Entry point: launches configured orchestrator
+├── archive-project.sh             # Archives one project and resets to main
 ├── lib/
 │   └── auto-motion.sh             # Shared shell library (CLI dispatch)
 ├── PROMPT.md                      # Basic silent workflow for an existing SRT

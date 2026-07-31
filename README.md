@@ -214,6 +214,28 @@ open final.mp4
 python3 production/tools/validate_publish.py publish.md --project-root .
 ```
 
+## 归档当前项目
+
+一条视频完成后，在仓库根目录运行：
+
+```bash
+./archive-project.sh --dry-run
+./archive-project.sh
+```
+
+脚本先把只属于当前项目的新增文件移动到同级目录
+`../_archive/<分支名-时间>/files/`，保留相对路径，并在归档根目录写入
+`MANIFEST.txt`；确认归档后，
+再把当前 worktree 切换为 detached HEAD，并固定在运行开始时解析出的 `main`
+提交。旧项目分支和历史不会被删除。下一步请让 agent 创建新的项目分支。
+
+可用 `--main-ref REF`、`--archive-root DIR`、`--archive-name NAME` 覆盖默认值，
+自动化时可加 `--yes`。脚本不会 fetch。
+
+如果相对 `main` 修改或删除了共享文件，脚本会在移动前停止，请先让 agent
+拆分或处理这些变更。如果存在 `.env`、缓存等被忽略文件，脚本也会停止，请让
+agent 判断应删除、归档还是保留；脚本不会猜测或扫描其中内容。
+
 ## 测试
 
 运行内置端到端测试：
@@ -242,6 +264,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest production/tests/test_publish_cont
 .
 ├── auto-motion.conf              # 编排/渲染工具配置
 ├── run-orchestrator.sh            # 便捷入口：按配置启动编排工具
+├── archive-project.sh             # 归档当前单片并复位到 main
 ├── lib/
 │   └── auto-motion.sh             # 共享 shell 库（CLI 分发）
 ├── PROMPT.md                      # 已有 SRT 的基础静音流程

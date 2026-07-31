@@ -7,6 +7,9 @@ LOG_DIR="$ROOT_DIR/auto-test/.tmp/logs"
 PROMPT_FILE="$TEST_DIR/PROMPT.md"
 EVENT_LOG="$LOG_DIR/orchestrator-events.jsonl"
 
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  "$ROOT_DIR/auto-test/test_archive_project.py" -v
+
 export AM_ROOT="$ROOT_DIR"
 source "$ROOT_DIR/lib/auto-motion.sh"
 am_load_config
